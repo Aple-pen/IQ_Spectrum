@@ -41,9 +41,9 @@ int main() {
 
     App app;
     app.LoadSettings();
-    while (!glfwWindowShouldClose(window)) {
-        glfwPollEvents();
 
+    // Render one frame (called from both the main loop and the refresh callback)
+    auto renderFrame = [&]() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -59,6 +59,23 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
+    };
+
+    // Called by Windows modal loop while the user drags/resizes the window
+    glfwSetWindowUserPointer(window, &renderFrame);
+    glfwSetWindowRefreshCallback(window, [](GLFWwindow* w) {
+        auto* fn = static_cast<decltype(renderFrame)*>(glfwGetWindowUserPointer(w));
+        (*fn)();
+    });
+    // WM_PAINT (refresh) fires on resize but NOT on move; pos callback covers move
+    glfwSetWindowPosCallback(window, [](GLFWwindow* w, int, int) {
+        auto* fn = static_cast<decltype(renderFrame)*>(glfwGetWindowUserPointer(w));
+        (*fn)();
+    });
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        renderFrame();
     }
 
     app.SaveSettings();

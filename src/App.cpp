@@ -106,7 +106,12 @@ void App::LoadSettings(const char* path) {
         } else if (key == "port") {
             port_ = std::stoi(val);
         } else if (key == "fftSize") {
-            fftSize_ = std::stoi(val);
+            const int v = std::stoi(val);
+            // Snap to nearest valid power-of-two >= 256
+            int snapped = 256;
+            for (int s : { 256, 512, 1024, 2048, 4096, 8192, 16384 })
+                if (s <= v) snapped = s;
+            fftSize_ = snapped;
         } else if (key == "chunkBytes") {
             chunkBytes_ = std::stoi(val);
         } else if (key == "sendIntervalMs") {
@@ -180,10 +185,14 @@ void App::Render() {
 
     RenderControls(snapshot);
     ImGui::SameLine();
-    RenderSpectrum(snapshot);
+    RenderSpectrum(snapshot, 0.0f);
 
     ImGui::End();
     ImGui::PopStyleColor(themeColors);
+
+    if (showConstellation_) {
+        RenderConstellation(snapshot);
+    }
 
     if (showDemo_) {
         ImPlot::ShowDemoWindow(&showDemo_);
@@ -234,6 +243,7 @@ void App::RenderControls(const StreamSnapshot& snapshot) {
         ImGui::CalcTextSize("Chunk bytes").x,
         ImGui::CalcTextSize("Interval ms").x,
         ImGui::CalcTextSize("FFT size").x,
+        ImGui::CalcTextSize("RBW (Hz)").x,
         ImGui::CalcTextSize("Sample rate Hz").x,
         ImGui::CalcTextSize("Sample format").x,
         ImGui::CalcTextSize("Channels").x,
@@ -262,9 +272,44 @@ void App::RenderControls(const StreamSnapshot& snapshot) {
 
     ImGui::Separator();
     ImGui::TextColored(accent, "FFT");
-    ImGui::InputInt("FFT size", &fftSize_);
-    if (!Fft::IsPowerOfTwo(fftSize_)) {
-        ImGui::TextColored(warnColor, "Power of two required");
+    {
+        static const int kFftSizes[] = { 256, 512, 1024, 2048, 4096, 8192, 16384 };
+        static const char* kFftLabels[] = { "256", "512", "1024", "2048", "4096", "8192", "16384" };
+        constexpr int kFftCount = 7;
+
+        // Helper: snap fs/rbw to nearest valid FFT size >= 256
+        auto rbwToFftSize = [&](float rbw) -> int {
+            if (rbw <= 0.0f || sampleRateHz_ <= 0.0f) return fftSize_;
+            const float ideal = sampleRateHz_ / rbw;
+            int best = kFftSizes[0];
+            float bestDist = std::abs(ideal - static_cast<float>(best));
+            for (int i = 1; i < kFftCount; ++i) {
+                const float d = std::abs(ideal - static_cast<float>(kFftSizes[i]));
+                if (d < bestDist) { bestDist = d; best = kFftSizes[i]; }
+            }
+            return best;
+        };
+
+        int curIdx = 0;
+        for (int i = 0; i < kFftCount; ++i)
+            if (kFftSizes[i] == fftSize_) { curIdx = i; break; }
+
+        if (ImGui::BeginCombo("FFT size", kFftLabels[curIdx])) {
+            for (int i = 0; i < kFftCount; ++i) {
+                const bool selected = (i == curIdx);
+                if (ImGui::Selectable(kFftLabels[i], selected))
+                    fftSize_ = kFftSizes[i];
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        // RBW display/edit: RBW = fs / N
+        float rbw = (sampleRateHz_ > 0.0f && fftSize_ > 0)
+            ? sampleRateHz_ / static_cast<float>(fftSize_) : 0.0f;
+        if (ImGui::InputFloat("RBW (Hz)", &rbw, 0.0f, 0.0f, "%.2f")) {
+            fftSize_ = rbwToFftSize(rbw);
+        }
     }
     ImGui::InputFloat("Sample rate Hz", &sampleRateHz_);
     if (ImGui::BeginCombo("Sample format", SampleFormatName(sampleFormatIndex_))) {
@@ -317,6 +362,18 @@ void App::RenderControls(const StreamSnapshot& snapshot) {
     }
 
     ImGui::Separator();
+    ImGui::TextColored(accent, "Constellation");
+    ImGui::Checkbox("Show constellation", &showConstellation_);
+    if (showConstellation_) {
+        ImGui::InputInt("Points", &constellationPoints_);
+        if (constellationPoints_ < 64) constellationPoints_ = 64;
+        if (constellationPoints_ > 8192) constellationPoints_ = 8192;
+        if (channels_ < 2) {
+            ImGui::TextColored(warnColor, "Needs Channels >= 2 (IQ)");
+        }
+    }
+
+    ImGui::Separator();
     if (!snapshot.running) {
         if (ImGui::Button("Start", ImVec2(110, 34))) {
             std::string error;
@@ -351,8 +408,8 @@ void App::RenderControls(const StreamSnapshot& snapshot) {
     ImGui::EndChild();
 }
 
-void App::RenderSpectrum(const StreamSnapshot& snapshot) {
-    ImGui::BeginChild("Spectrum", ImVec2(0, 0), true);
+void App::RenderSpectrum(const StreamSnapshot& snapshot, float width) {
+    ImGui::BeginChild("Spectrum", ImVec2(width, 0), true);
     {
         const ImVec4 specAccent = chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f) : ImVec4(0.169f, 0.424f, 0.690f, 1.0f);
         ImGui::TextColored(specAccent, "Spectrum");
@@ -381,7 +438,8 @@ void App::RenderSpectrum(const StreamSnapshot& snapshot) {
     if (ImPlot::BeginPlot("##spectrum", plotSize)) {
         ImPlot::SetupAxes("Frequency (Hz)", "Magnitude (dB)");
         if (!snapshot.frequencies.empty() && snapshot.frequencies.size() == snapshot.magnitudesDb.size()) {
-            const double xMax = std::max(1.0, static_cast<double>(snapshot.frequencies.back()));
+            const double xMin = static_cast<double>(snapshot.frequencies.front());
+            const double xMax = static_cast<double>(snapshot.frequencies.back());
             double yMin = -160.0;
             double yMax = 10.0;
             if (yAxisAuto_) {
@@ -407,7 +465,7 @@ void App::RenderSpectrum(const StreamSnapshot& snapshot) {
                 yMin = static_cast<double>(yAxisMin_);
                 yMax = static_cast<double>(yAxisMax_);
             }
-            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, xMax, ImGuiCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
             ImPlot::PushStyleColor(ImPlotCol_Line, chartDark_
                 ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f)
@@ -431,8 +489,14 @@ void App::RenderSpectrum(const StreamSnapshot& snapshot) {
             static_cast<int>(spectrogramBuf_.size()) != spectrogramRows_ * bins) {
             spectrogramBins_ = bins;
             spectrogramBuf_.assign(static_cast<size_t>(spectrogramRows_ * bins), -180.0f);
+            spectrogramDisp_.clear();
             spectrogramHead_ = 0;
             spectrogramFill_ = 0;
+            lastFftFrameCount_ = 0;
+        }
+
+        // Detect streamer restart: fftFrameCount resets to 0
+        if (snapshot.fftFrameCount < lastFftFrameCount_) {
             lastFftFrameCount_ = 0;
         }
 
@@ -451,11 +515,16 @@ void App::RenderSpectrum(const StreamSnapshot& snapshot) {
 
         if (spectrogramFill_ > 0) {
             // Build linear display buffer: oldest row at top (index 0)
-            std::vector<float> disp(static_cast<size_t>(spectrogramRows_ * bins), -180.0f);
+            // Reuse pre-allocated buffer to avoid per-frame heap allocation
+            const size_t dispSize = static_cast<size_t>(spectrogramRows_ * bins);
+            if (spectrogramDisp_.size() != dispSize) {
+                spectrogramDisp_.assign(dispSize, -180.0f);
+            }
+            std::fill(spectrogramDisp_.begin(), spectrogramDisp_.end(), -180.0f);
             for (int r = 0; r < spectrogramFill_; ++r) {
                 const int srcRow = (spectrogramHead_ + r) % spectrogramRows_;
                 std::copy_n(spectrogramBuf_.begin() + srcRow * bins,
-                    bins, disp.begin() + r * bins);
+                    bins, spectrogramDisp_.begin() + r * bins);
             }
 
             // dB scale bounds
@@ -487,23 +556,25 @@ void App::RenderSpectrum(const StreamSnapshot& snapshot) {
             const ImPlotColormap cmap = chartDark_ ? ImPlotColormap_Plasma : ImPlotColormap_Viridis;
             ImPlot::PushColormap(cmap);
 
-            const double xMax = snapshot.frequencies.empty()
+            const double xMin2 = snapshot.frequencies.empty()
+                ? 0.0 : static_cast<double>(snapshot.frequencies.front());
+            const double xMax2 = snapshot.frequencies.empty()
                 ? 1.0 : static_cast<double>(snapshot.frequencies.back());
 
             const ImVec2 spectroSize(-1, histH);
             if (ImPlot::BeginPlot("##spectrogram", spectroSize)) {
                 ImPlot::SetupAxes("Frequency (Hz)", "Time (frames)");
-                ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, xMax, ImGuiCond_Always);
+                ImPlot::SetupAxisLimits(ImAxis_X1, xMin2, xMax2, ImGuiCond_Always);
                 ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0,
                     static_cast<double>(spectrogramRows_), ImGuiCond_Always);
                 // rows=spectrogramRows_, cols=bins
-                // bounds: (xMin,yMin)=(0,0) → (xMax, spectrogramRows_)
+                // bounds: (xMin2,yMin)=(freq_start,0) → (xMax2, spectrogramRows_)
                 ImPlot::PlotHeatmap("##heatmap",
-                    disp.data(), spectrogramRows_, bins,
+                    spectrogramDisp_.data(), spectrogramRows_, bins,
                     static_cast<double>(scaleMin), static_cast<double>(scaleMax),
                     nullptr,
-                    ImPlotPoint(0.0, 0.0),
-                    ImPlotPoint(xMax, static_cast<double>(spectrogramRows_)));
+                    ImPlotPoint(xMin2, 0.0),
+                    ImPlotPoint(xMax2, static_cast<double>(spectrogramRows_)));
                 ImPlot::EndPlot();
             }
             ImPlot::PopColormap();
@@ -512,4 +583,59 @@ void App::RenderSpectrum(const StreamSnapshot& snapshot) {
     }
 
     ImGui::EndChild();
+}
+
+void App::RenderConstellation(const StreamSnapshot& snapshot) {
+    ImGui::SetNextWindowSize(ImVec2(420, 440), ImGuiCond_FirstUseEver);
+    bool open = showConstellation_;
+    if (!ImGui::Begin("Constellation", &open)) {
+        ImGui::End();
+        showConstellation_ = open;
+        return;
+    }
+    showConstellation_ = open;
+
+    if (chartDark_) {
+        ImPlot::PushStyleColor(ImPlotCol_PlotBg,   ImVec4(0.031f, 0.035f, 0.055f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_FrameBg,  ImVec4(0.059f, 0.078f, 0.125f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisText, ImVec4(0.478f, 0.561f, 0.710f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisGrid, ImVec4(0.102f, 0.145f, 0.251f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisTick, ImVec4(0.165f, 0.227f, 0.345f, 1.0f));
+    } else {
+        ImPlot::PushStyleColor(ImPlotCol_PlotBg,   ImVec4(0.961f, 0.973f, 1.000f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_FrameBg,  ImVec4(0.910f, 0.937f, 0.973f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisText, ImVec4(0.227f, 0.314f, 0.439f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisGrid, ImVec4(0.753f, 0.816f, 0.878f, 1.0f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisTick, ImVec4(0.478f, 0.604f, 0.733f, 1.0f));
+    }
+
+    const bool hasData = !snapshot.iSamples.empty()
+        && snapshot.iSamples.size() == snapshot.qSamples.size();
+
+    if (ImPlot::BeginPlot("##constellation", ImVec2(-1, -1), ImPlotFlags_Equal)) {
+        ImPlot::SetupAxes("I", "Q");
+        ImPlot::SetupAxisLimits(ImAxis_X1, -1.5, 1.5, ImGuiCond_Once);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, -1.5, 1.5, ImGuiCond_Once);
+
+        if (hasData) {
+            const int total  = static_cast<int>(snapshot.iSamples.size());
+            const int count  = std::min(constellationPoints_, total);
+            const int offset = total - count;
+
+            ImPlot::PushStyleColor(ImPlotCol_MarkerFill,
+                chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 0.7f)
+                           : ImVec4(0.169f, 0.424f, 0.690f, 0.7f));
+            ImPlot::PushStyleColor(ImPlotCol_MarkerOutline, ImVec4(0, 0, 0, 0));
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 2.0f);
+            ImPlot::PlotScatter("IQ",
+                snapshot.iSamples.data() + offset,
+                snapshot.qSamples.data() + offset,
+                count);
+            ImPlot::PopStyleColor(2);
+        }
+        ImPlot::EndPlot();
+    }
+    ImPlot::PopStyleColor(5);
+
+    ImGui::End();
 }

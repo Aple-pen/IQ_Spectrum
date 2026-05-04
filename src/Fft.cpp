@@ -55,6 +55,54 @@ std::vector<float> Fft::MagnitudeSpectrum(const std::vector<float>& samples, int
     return magnitudes;
 }
 
+std::vector<float> Fft::MagnitudeSpectrumIQ(const std::vector<float>& iSamples, const std::vector<float>& qSamples, int fftSize, float sampleRateHz) {
+    if (!IsPowerOfTwo(fftSize)
+        || static_cast<int>(iSamples.size()) < fftSize
+        || static_cast<int>(qSamples.size()) < fftSize) {
+        return {};
+    }
+
+    // DC removal (mean subtraction per component)
+    const int offsetI = static_cast<int>(iSamples.size()) - fftSize;
+    const int offsetQ = static_cast<int>(qSamples.size()) - fftSize;
+    float meanI = 0.0f, meanQ = 0.0f;
+    for (int n = 0; n < fftSize; ++n) {
+        const float si = iSamples[static_cast<size_t>(offsetI + n)];
+        const float sq = qSamples[static_cast<size_t>(offsetQ + n)];
+        meanI += std::isfinite(si) ? si : 0.0f;
+        meanQ += std::isfinite(sq) ? sq : 0.0f;
+    }
+    meanI /= static_cast<float>(fftSize);
+    meanQ /= static_cast<float>(fftSize);
+
+    std::vector<std::complex<float>> values(static_cast<size_t>(fftSize));
+    for (int n = 0; n < fftSize; ++n) {
+        float si = iSamples[static_cast<size_t>(offsetI + n)] - meanI;
+        float sq = qSamples[static_cast<size_t>(offsetQ + n)] - meanQ;
+        if (!std::isfinite(si)) si = 0.0f;
+        if (!std::isfinite(sq)) sq = 0.0f;
+        const float w = Hann(n, fftSize);
+        values[static_cast<size_t>(n)] = std::complex<float>(si * w, sq * w);
+    }
+
+    Transform(values);
+
+    // Full N bins, scale = 1/N for complex
+    const float scale = 1.0f / static_cast<float>(fftSize);
+    std::vector<float> magnitudes(static_cast<size_t>(fftSize));
+    for (int k = 0; k < fftSize; ++k) {
+        const float magnitude = std::abs(values[static_cast<size_t>(k)]) * scale;
+        const float db = 20.0f * std::log10(std::max(magnitude, 1.0e-9f));
+        magnitudes[static_cast<size_t>(k)] = std::isfinite(db) ? std::max(db, -180.0f) : -180.0f;
+    }
+
+    // fftshift: rotate so DC moves to center (-fs/2 .. 0 .. +fs/2)
+    std::rotate(magnitudes.begin(), magnitudes.begin() + fftSize / 2, magnitudes.end());
+
+    (void)sampleRateHz;
+    return magnitudes;
+}
+
 void Fft::Transform(std::vector<std::complex<float>>& values) {
     const size_t size = values.size();
     size_t bitReversed = 0;

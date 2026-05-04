@@ -57,6 +57,8 @@ bool BinStreamer::Start(const StreamConfig& config, std::string& error) {
         snapshot_.running = true;
         snapshot_.status = "Starting";
         sampleBuffer_.clear();
+        iSampleBuffer_.clear();
+        qSampleBuffer_.clear();
         remainderBytes_.clear();
     }
 
@@ -198,16 +200,28 @@ void BinStreamer::AppendSamples(const std::vector<uint8_t>& bytes, const StreamC
     std::vector<float> parsed;
     parsed.reserve(totalFrames);
 
-    for (size_t frame = 0; frame < totalFrames; ++frame) {
-        const size_t sampleOffset = frame * bytesPerFrame + static_cast<size_t>(channelIdx) * bytesPerSample;
-        const uint8_t* ptr = buf.data() + sampleOffset;
+    // IQ constellation: extract I(ch0) and Q(ch1) when 2+ channels available
+    const bool hasIQ = channels >= 2;
+    std::vector<float> iBuf, qBuf;
+    // Always attempt IQ extraction if at least 2 samples per frame are available
+    const bool canExtractIQ = bytesPerFrame >= bytesPerSample * 2;
+    iBuf.reserve(totalFrames);
+    qBuf.reserve(totalFrames);
 
-        if (config.sampleFormat == SampleFormat::UInt8) {
-            parsed.push_back((static_cast<float>(*ptr) - 128.0f) / 128.0f);
-        } else if (config.sampleFormat == SampleFormat::Int16LE) {
-            parsed.push_back(static_cast<float>(ReadInt16LE(ptr)) / 32768.0f);
-        } else {
-            parsed.push_back(ReadFloat32LE(ptr));
+    auto readSample = [&](const uint8_t* ptr) -> float {
+        if (config.sampleFormat == SampleFormat::UInt8)
+            return (static_cast<float>(*ptr) - 128.0f) / 128.0f;
+        if (config.sampleFormat == SampleFormat::Int16LE)
+            return static_cast<float>(ReadInt16LE(ptr)) / 32768.0f;
+        return ReadFloat32LE(ptr);
+    };
+
+    for (size_t frame = 0; frame < totalFrames; ++frame) {
+        const size_t frameBase = frame * bytesPerFrame;
+        parsed.push_back(readSample(buf.data() + frameBase + static_cast<size_t>(channelIdx) * bytesPerSample));
+        if (canExtractIQ) {
+            iBuf.push_back(readSample(buf.data() + frameBase));
+            qBuf.push_back(readSample(buf.data() + frameBase + bytesPerSample));
         }
     }
 
@@ -221,21 +235,60 @@ void BinStreamer::AppendSamples(const std::vector<uint8_t>& bytes, const StreamC
 
     const size_t maxSamples = static_cast<size_t>(config.fftSize * 4);
 
-    sampleBuffer_.insert(sampleBuffer_.end(), parsed.begin(), parsed.end());
-    if (sampleBuffer_.size() > maxSamples) {
-        sampleBuffer_.erase(sampleBuffer_.begin(),
-            sampleBuffer_.end() - static_cast<std::ptrdiff_t>(maxSamples));
+    if (hasIQ) {
+        // IQ complex FFT path: accumulate I and Q separately
+        auto trimAppend = [&](std::vector<float>& dst, const std::vector<float>& src) {
+            dst.insert(dst.end(), src.begin(), src.end());
+            if (dst.size() > maxSamples)
+                dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(maxSamples));
+        };
+        trimAppend(iSampleBuffer_, iBuf);
+        trimAppend(qSampleBuffer_, qBuf);
+
+        if (static_cast<int>(iSampleBuffer_.size()) >= config.fftSize) {
+            snapshot_.magnitudesDb = Fft::MagnitudeSpectrumIQ(
+                iSampleBuffer_, qSampleBuffer_, config.fftSize, config.sampleRateHz);
+            const int N = static_cast<int>(snapshot_.magnitudesDb.size());
+            snapshot_.frequencies.resize(static_cast<size_t>(N));
+            for (int k = 0; k < N; ++k) {
+                snapshot_.frequencies[static_cast<size_t>(k)] =
+                    (static_cast<float>(k - N / 2) * config.sampleRateHz) / static_cast<float>(N);
+            }
+            snapshot_.fftFrameCount += 1;
+        }
+    } else {
+        // Real-only FFT fallback (mono)
+        sampleBuffer_.insert(sampleBuffer_.end(), parsed.begin(), parsed.end());
+        if (sampleBuffer_.size() > maxSamples)
+            sampleBuffer_.erase(sampleBuffer_.begin(),
+                sampleBuffer_.end() - static_cast<std::ptrdiff_t>(maxSamples));
+
+        if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
+            snapshot_.magnitudesDb = Fft::MagnitudeSpectrum(
+                sampleBuffer_, config.fftSize, config.sampleRateHz);
+            std::rotate(snapshot_.magnitudesDb.begin(),
+                snapshot_.magnitudesDb.begin() + snapshot_.magnitudesDb.size() / 2,
+                snapshot_.magnitudesDb.end());
+            const int N = static_cast<int>(snapshot_.magnitudesDb.size());
+            snapshot_.frequencies.resize(static_cast<size_t>(N));
+            for (int k = 0; k < N; ++k) {
+                snapshot_.frequencies[static_cast<size_t>(k)] =
+                    (static_cast<float>(k) * config.sampleRateHz) / static_cast<float>(config.fftSize);
+            }
+            snapshot_.fftFrameCount += 1;
+        }
     }
 
-    if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
-        snapshot_.magnitudesDb = Fft::MagnitudeSpectrum(sampleBuffer_, config.fftSize, config.sampleRateHz);
-        std::rotate(snapshot_.magnitudesDb.begin(), snapshot_.magnitudesDb.begin() + snapshot_.magnitudesDb.size() / 2, snapshot_.magnitudesDb.end());
-        snapshot_.frequencies.resize(snapshot_.magnitudesDb.size());
-        for (size_t bin = 0; bin < snapshot_.frequencies.size(); ++bin) {
-            snapshot_.frequencies[bin] =
-                (static_cast<float>(bin) * config.sampleRateHz) / static_cast<float>(config.fftSize);
-        }
-        snapshot_.fftFrameCount += 1;
+    // Constellation: always update if IQ bytes were available
+    if (canExtractIQ && !iBuf.empty()) {
+        const size_t keep = static_cast<size_t>(config.fftSize);
+        auto trimAppendSnap = [&](std::vector<float>& dst, const std::vector<float>& src) {
+            dst.insert(dst.end(), src.begin(), src.end());
+            if (dst.size() > keep)
+                dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(keep));
+        };
+        trimAppendSnap(snapshot_.iSamples, iBuf);
+        trimAppendSnap(snapshot_.qSamples, qBuf);
     }
 }
 

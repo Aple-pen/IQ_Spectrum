@@ -39,6 +39,8 @@ struct StreamSnapshot {
     std::string error;
     std::vector<float> frequencies;
     std::vector<float> magnitudesDb;
+    std::vector<float> iSamples;   // recent I samples (constellation)
+    std::vector<float> qSamples;   // recent Q samples (constellation)
 };
 
 class BinStreamer {
@@ -62,6 +64,8 @@ private:
     std::thread worker_;
     std::atomic_bool stopRequested_ = false;
     StreamSnapshot snapshot_;
-    std::vector<float> sampleBuffer_;
+    std::vector<float> sampleBuffer_;    // real-only fallback (mono)
+    std::vector<float> iSampleBuffer_;   // I channel accumulator (IQ mode)
+    std::vector<float> qSampleBuffer_;   // Q channel accumulator (IQ mode)
     std::vector<uint8_t> remainderBytes_; // chunk 경계 미완성 바이트 carry-over
 };
