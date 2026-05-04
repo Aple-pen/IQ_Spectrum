@@ -40,6 +40,7 @@ int main() {
     ImGui_ImplOpenGL3_Init(glslVersion);
 
     App app;
+    app.LoadSettings();
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -60,12 +61,14 @@ int main() {
         glfwSwapBuffers(window);
     }
 
+    app.SaveSettings();
+
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window);
-    glfwTerminate();
+    glfwTerminate(); 
     return 0;
 }

@@ -219,8 +219,9 @@ void BinStreamer::AppendSamples(const std::vector<uint8_t>& bytes, const StreamC
         return;
     }
 
-    sampleBuffer_.insert(sampleBuffer_.end(), parsed.begin(), parsed.end());
     const size_t maxSamples = static_cast<size_t>(config.fftSize * 4);
+
+    sampleBuffer_.insert(sampleBuffer_.end(), parsed.begin(), parsed.end());
     if (sampleBuffer_.size() > maxSamples) {
         sampleBuffer_.erase(sampleBuffer_.begin(),
             sampleBuffer_.end() - static_cast<std::ptrdiff_t>(maxSamples));
@@ -228,11 +229,13 @@ void BinStreamer::AppendSamples(const std::vector<uint8_t>& bytes, const StreamC
 
     if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
         snapshot_.magnitudesDb = Fft::MagnitudeSpectrum(sampleBuffer_, config.fftSize, config.sampleRateHz);
+        std::rotate(snapshot_.magnitudesDb.begin(), snapshot_.magnitudesDb.begin() + snapshot_.magnitudesDb.size() / 2, snapshot_.magnitudesDb.end());
         snapshot_.frequencies.resize(snapshot_.magnitudesDb.size());
         for (size_t bin = 0; bin < snapshot_.frequencies.size(); ++bin) {
             snapshot_.frequencies[bin] =
                 (static_cast<float>(bin) * config.sampleRateHz) / static_cast<float>(config.fftSize);
         }
+        snapshot_.fftFrameCount += 1;
     }
 }
 

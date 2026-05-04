@@ -3,11 +3,15 @@
 #include "BinStreamer.h"
 
 #include <array>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 class App {
 public:
     void Render();
+    void LoadSettings(const char* path = "settings.ini");
+    void SaveSettings(const char* path = "settings.ini") const;
 
 private:
     StreamConfig BuildConfig() const;
@@ -28,6 +32,16 @@ private:
     int channelIndex_ = 0;
     bool showDemo_ = false;
     bool chartDark_ = true;
+    bool yAxisAuto_ = true;
+    float yAxisMin_ = -160.0f;
+    float yAxisMax_ = 10.0f;
+    bool showSpectrogram_ = false;
+    int spectrogramRows_ = 200;          // number of time rows to keep
+    std::vector<float> spectrogramBuf_;  // ring buffer [row * bins + bin]
+    int spectrogramHead_ = 0;            // index of oldest row
+    int spectrogramFill_ = 0;            // number of valid rows written
+    int spectrogramBins_ = 0;            // current bin count (detect reset)
+    uint64_t lastFftFrameCount_ = 0;
     std::string lastError_;
     BinStreamer streamer_;
 };

@@ -6,6 +6,7 @@
 class Fft {
 public:
     static bool IsPowerOfTwo(int value);
+    // Real-input: returns N/2 bins, frequencies 0..fs/2
     static std::vector<float> MagnitudeSpectrum(const std::vector<float>& samples, int fftSize, float sampleRateHz);
 
 private:

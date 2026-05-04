@@ -34,6 +34,7 @@ struct StreamSnapshot {
     bool listening = false;
     uint64_t bytesSent = 0;
     uint64_t packetsSent = 0;
+    uint64_t fftFrameCount = 0;
     std::string status = "Idle";
     std::string error;
     std::vector<float> frequencies;
