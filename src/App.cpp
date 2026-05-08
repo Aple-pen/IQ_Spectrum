@@ -142,6 +142,8 @@ void App::LoadSettings(const char* path) {
             showSpectrogram_ = val == "1";
         } else if (key == "spectrogramRows") {
             spectrogramRows_ = std::stoi(val);
+        } else if (key == "freqOffsetHz") {
+            freqOffsetHz_ = std::stof(val);
         }
     }
 }
@@ -169,6 +171,7 @@ void App::SaveSettings(const char* path) const {
     f << "histogramBins=" << spectrogramRows_ << '\n';
     f << "showSpectrogram=" << (showSpectrogram_ ? 1 : 0) << '\n';
     f << "spectrogramRows=" << spectrogramRows_ << '\n';
+    f << "freqOffsetHz=" << freqOffsetHz_ << '\n';
 }
 
 void App::Render() {
@@ -372,6 +375,22 @@ void App::RenderControls(const StreamSnapshot& snapshot) {
             ImGui::TextColored(warnColor, "Needs Channels >= 2 (IQ)");
         }
     }
+
+    ImGui::Separator();
+    ImGui::TextColored(accent, "IQ Freq Offset");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0f);
+    if (ImGui::DragFloat("##freqOffset", &freqOffsetHz_,
+        sampleRateHz_ > 0 ? sampleRateHz_ / static_cast<float>(fftSize_) : 1.0f,
+        -sampleRateHz_ * 0.5f, sampleRateHz_ * 0.5f, "%.1f Hz")) {
+        streamer_.SetFreqOffset(freqOffsetHz_);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset##fo")) {
+        freqOffsetHz_ = 0.0f;
+        streamer_.SetFreqOffset(0.0f);
+    }
+    // keep streamer in sync even if value unchanged (e.g. after load)
+    streamer_.SetFreqOffset(freqOffsetHz_);
 
     ImGui::Separator();
     if (!snapshot.running) {

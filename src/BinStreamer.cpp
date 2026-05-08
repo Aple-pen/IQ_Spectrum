@@ -246,8 +246,9 @@ void BinStreamer::AppendSamples(const std::vector<uint8_t>& bytes, const StreamC
         trimAppend(qSampleBuffer_, qBuf);
 
         if (static_cast<int>(iSampleBuffer_.size()) >= config.fftSize) {
+            const float freqOffset = freqOffsetHz_.load(std::memory_order_relaxed);
             snapshot_.magnitudesDb = Fft::MagnitudeSpectrumIQ(
-                iSampleBuffer_, qSampleBuffer_, config.fftSize, config.sampleRateHz);
+                iSampleBuffer_, qSampleBuffer_, config.fftSize, config.sampleRateHz, freqOffset);
             const int N = static_cast<int>(snapshot_.magnitudesDb.size());
             snapshot_.frequencies.resize(static_cast<size_t>(N));
             for (int k = 0; k < N; ++k) {

@@ -55,7 +55,7 @@ std::vector<float> Fft::MagnitudeSpectrum(const std::vector<float>& samples, int
     return magnitudes;
 }
 
-std::vector<float> Fft::MagnitudeSpectrumIQ(const std::vector<float>& iSamples, const std::vector<float>& qSamples, int fftSize, float sampleRateHz) {
+std::vector<float> Fft::MagnitudeSpectrumIQ(const std::vector<float>& iSamples, const std::vector<float>& qSamples, int fftSize, float sampleRateHz, float freqOffsetHz) {
     if (!IsPowerOfTwo(fftSize)
         || static_cast<int>(iSamples.size()) < fftSize
         || static_cast<int>(qSamples.size()) < fftSize) {
@@ -75,14 +75,23 @@ std::vector<float> Fft::MagnitudeSpectrumIQ(const std::vector<float>& iSamples, 
     meanI /= static_cast<float>(fftSize);
     meanQ /= static_cast<float>(fftSize);
 
+    // Frequency offset: multiply by e^(-j*2*pi*freqOffset*n/fs) to shift spectrum
+    const float phaseInc = -2.0f * Pi * freqOffsetHz / sampleRateHz;
+
     std::vector<std::complex<float>> values(static_cast<size_t>(fftSize));
     for (int n = 0; n < fftSize; ++n) {
         float si = iSamples[static_cast<size_t>(offsetI + n)] - meanI;
         float sq = qSamples[static_cast<size_t>(offsetQ + n)] - meanQ;
         if (!std::isfinite(si)) si = 0.0f;
         if (!std::isfinite(sq)) sq = 0.0f;
+        // Apply heterodyne rotation
+        const float phase = phaseInc * static_cast<float>(n);
+        const float cosP = std::cos(phase);
+        const float sinP = std::sin(phase);
+        const float ri = si * cosP - sq * sinP;
+        const float rq = si * sinP + sq * cosP;
         const float w = Hann(n, fftSize);
-        values[static_cast<size_t>(n)] = std::complex<float>(si * w, sq * w);
+        values[static_cast<size_t>(n)] = std::complex<float>(ri * w, rq * w);
     }
 
     Transform(values);

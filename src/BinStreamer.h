@@ -54,6 +54,7 @@ public:
     bool Start(const StreamConfig& config, std::string& error);
     void Stop();
     StreamSnapshot Snapshot() const;
+    void SetFreqOffset(float hz) { freqOffsetHz_.store(hz, std::memory_order_relaxed); }
 
 private:
     void Run(StreamConfig config);
@@ -63,6 +64,7 @@ private:
     mutable std::mutex mutex_;
     std::thread worker_;
     std::atomic_bool stopRequested_ = false;
+    std::atomic<float> freqOffsetHz_{ 0.0f };
     StreamSnapshot snapshot_;
     std::vector<float> sampleBuffer_;    // real-only fallback (mono)
     std::vector<float> iSampleBuffer_;   // I channel accumulator (IQ mode)

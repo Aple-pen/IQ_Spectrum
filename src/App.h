@@ -40,6 +40,7 @@ private:
     int spectrogramRows_ = 200;          // number of time rows to keep
     bool showConstellation_ = false;
     int constellationPoints_ = 1024;     // number of IQ points to display
+    float freqOffsetHz_ = 0.0f;          // IQ heterodyne offset (shifts spectrum center)
     std::vector<float> spectrogramBuf_;  // ring buffer [row * bins + bin]
     std::vector<float> spectrogramDisp_; // linear display buffer (reused each frame)
     int spectrogramHead_ = 0;            // index of oldest row
