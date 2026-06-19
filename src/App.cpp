@@ -11,10 +11,22 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
 
+namespace port {
+enum class FrequencyValues {
+  FREQ_915_MHZ = 23000,
+  FREQ_433_MHZ = 23001,
+  FREQ_5_8_GHZ_LOW = 23002,
+  FREQ_5_8_GHZ_MID = 23003,
+  FREQ_5_8_GHZ_HIGH = 23004,
+  FREQ_2_4_GHZ_LOW = 23005,
+  FREQ_2_4_GHZ_HIGH = 23006,
+};
+}
 namespace {
 int PushImGuiTheme(bool dark) {
   if (dark) {
@@ -123,6 +135,30 @@ int PushImGuiTheme(bool dark) {
   return 25;
 }
 
+const char *FrequencyName(int index) {
+  static const char *kNames[] = {"915 MHz",      "433 MHz",
+                                 "5.8 GHz_Low",  "5.8 GHz_Mid",
+                                 "5.8 GHz_High", "2.4 GHz Low",
+                                 "2.4 GHz High"};
+  if (index < 0 || index >= 7) {
+    return "unknown";
+  }
+  return kNames[index];
+}
+
+// 캡처 파일명 생성: "yyyymmdd hhmmss _ <frequency>.bin"
+// (Windows 파일명에 ':' 사용 불가하여 시:분:초 구분자는 생략)
+std::string MakeCaptureFileName(int frequencyIndex) {
+  std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  localtime_s(&tm, &now);
+  char stamp[32];
+  std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d %02d%02d%02d",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+                tm.tm_min, tm.tm_sec);
+  return std::string(stamp) + " _ " + FrequencyName(frequencyIndex) + ".bin";
+}
+
 const char *SampleFormatName(int index) {
   switch (static_cast<SampleFormat>(index)) {
   case SampleFormat::UInt8:
@@ -205,6 +241,8 @@ void App::LoadSettings(const char *path) {
       spectrogramRows_ = std::stoi(val);
     } else if (key == "freqOffsetHz") {
       freqOffsetHz_ = std::stof(val);
+    } else if (key == "frequencyIndex") {
+      frequencyIndex_ = std::stoi(val);
     }
   }
 }
@@ -237,6 +275,7 @@ void App::SaveSettings(const char *path) const {
   f << "showSpectrogram=" << (showSpectrogram_ ? 1 : 0) << '\n';
   f << "spectrogramRows=" << spectrogramRows_ << '\n';
   f << "freqOffsetHz=" << freqOffsetHz_ << '\n';
+  f << "frequencyIndex=" << frequencyIndex_ << '\n';
 }
 
 IqStream &App::Active() {
@@ -301,6 +340,7 @@ StreamConfig App::BuildConfig() const {
   config.channels = std::max(1, channels_);
   config.channelIndex =
       std::max(0, std::min(channelIndex_, config.channels - 1));
+  config.frequencyIndex = frequencyIndex_;
   return config;
 }
 
@@ -345,9 +385,12 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
                           innerSpacing * 2.0f;
   ImGui::PushItemWidth(-maxLabelW);
 
+  // 캡처 중에는 Start/Stop · Capture 버튼을 제외한 모든 컨트롤을 잠금.
+  ImGui::BeginDisabled(snapshot.captureActive);
+
   // 모드 선택: 재생(서버) vs 실시간 수신(클라이언트). 실행 중에는 잠금.
   ImGui::TextColored(accent, "Mode");
-  ImGui::BeginDisabled(snapshot.running);
+  ImGui::BeginDisabled(snapshot.streamRunning);
   ImGui::RadioButton("Playback (Server)", &mode_,
                      static_cast<int>(Mode::Playback));
   ImGui::SameLine();
@@ -383,7 +426,30 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
     // 실시간 수신(클라이언트) 모드: 접속할 서버 IP/포트
     ImGui::TextColored(accent, "TCP Client");
     ImGui::InputText("Server IP", serverIp_.data(), serverIp_.size());
-    ImGui::InputInt("Server Port", &serverPort_);
+    static const port::FrequencyValues FrequencyValues[] = {
+        port::FrequencyValues::FREQ_915_MHZ,
+        port::FrequencyValues::FREQ_433_MHZ,
+        port::FrequencyValues::FREQ_5_8_GHZ_LOW,
+        port::FrequencyValues::FREQ_5_8_GHZ_MID,
+        port::FrequencyValues::FREQ_5_8_GHZ_HIGH,
+        port::FrequencyValues::FREQ_2_4_GHZ_LOW,
+        port::FrequencyValues::FREQ_2_4_GHZ_HIGH};
+
+    if (ImGui::BeginCombo("Frequency", FrequencyName(frequencyIndex_))) {
+      for (int index = 0; index < 7; ++index) {
+        const bool selected = frequencyIndex_ == index;
+        if (ImGui::Selectable(FrequencyName(index), selected)) {
+          frequencyIndex_ = index;
+        }
+        if (selected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+
+    serverPort_ = static_cast<int>(FrequencyValues[frequencyIndex_]);
+    // ImGui::InputInt("Server Port", &serverPort_);
 
     ImGui::Separator();
     ImGui::TextColored(accent, "Stream");
@@ -542,8 +608,11 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   // keep active component in sync even if value unchanged (e.g. after load)
   Active().SetFreqOffset(freqOffsetHz_);
 
+  // 여기까지가 캡처 중 잠금 대상. 아래 Start/Stop·Capture 버튼은 활성 유지.
+  ImGui::EndDisabled();
+
   ImGui::Separator();
-  if (!snapshot.running) {
+  if (!snapshot.streamRunning) {
     if (ImGui::Button("Start", ImVec2(110, 34))) {
       std::string error;
       const bool ok = receiveMode ? receiver_.Start(BuildConfig(), error)
@@ -558,9 +627,29 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
     }
   }
   ImGui::SameLine();
+  // 캡처는 Receive 모드에서만 동작 (TCP payload 수신 경로)
+  ImGui::BeginDisabled(!receiveMode);
+  if (!snapshot.captureActive) {
+    if (ImGui::Button("Capture", ImVec2(110, 34))) {
+      // STX/ETX를 제외한 수신 payload를 파일로 기록 시작
+      const std::string path = MakeCaptureFileName(frequencyIndex_);
+      std::string error;
+      if (!Active().StartCapture(path, error)) {
+        lastError_ = error;
+      }
+    }
+  } else {
+    if (ImGui::Button("Stop Capture", ImVec2(110, 34))) {
+      Active().StopCapture();
+    }
+  }
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::BeginDisabled(snapshot.captureActive);
   if (ImGui::Button("ImPlot Demo", ImVec2(110, 34))) {
     showDemo_ = !showDemo_;
   }
+  ImGui::EndDisabled();
 
   ImGui::Separator();
   ImGui::Text("Status: %s", snapshot.status.c_str());

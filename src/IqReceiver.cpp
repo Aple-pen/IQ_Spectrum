@@ -3,94 +3,181 @@
 #include "Fft.h"
 #include "TcpReceiver.h"
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
 #include <thread>
+#include <vector>
 
-bool IqReceiver::Start(const StreamConfig& config, std::string& error) {
-    if (config.ip.empty()) {
-        error = "Enter the server IP to connect to";
-        return false;
-    }
-    if (config.port == 0) {
-        error = "Port must be 1..65535";
-        return false;
-    }
-    if (config.chunkBytes <= 0) {
-        error = "Chunk size must be greater than zero";
-        return false;
-    }
-    if (!Fft::IsPowerOfTwo(config.fftSize)) {
-        error = "FFT size must be a power of two";
-        return false;
-    }
+bool IqReceiver::Start(const StreamConfig &config, std::string &error) {
+  if (config.ip.empty()) {
+    error = "Enter the server IP to connect to";
+    return false;
+  }
+  if (config.port == 0) {
+    error = "Port must be 1..65535";
+    return false;
+  }
+  if (config.chunkBytes <= 0) {
+    error = "Chunk size must be greater than zero";
+    return false;
+  }
+  if (!Fft::IsPowerOfTwo(config.fftSize)) {
+    error = "FFT size must be a power of two";
+    return false;
+  }
 
-    StartWorker(config);
-    return true;
+  StartWorker(config);
+  return true;
+}
+
+bool IqReceiver::RecvExact(TcpReceiver &client, uint8_t *dst, size_t n,
+                          std::string &error) {
+  size_t got = 0;
+  while (got < n) {
+    if (stopRequested_) {
+      error.clear(); // 중단 요청: 오류 아님
+      return false;
+    }
+    const int want =
+        static_cast<int>(std::min<size_t>(n - got, static_cast<size_t>(INT_MAX)));
+    const int r = client.Recv(dst + got, want, 200, error);
+    if (r == -2) {
+      continue; // 타임아웃: stop 여부 재확인 후 재시도
+    }
+    if (r == 0) {
+      error = "Server closed connection";
+      return false;
+    }
+    if (r < 0) {
+      return false; // 오류: error는 Recv가 설정
+    }
+    got += static_cast<size_t>(r);
+  }
+  return true;
 }
 
 void IqReceiver::Run(StreamConfig config) {
-    std::vector<uint8_t> buffer(static_cast<size_t>(config.chunkBytes));
+  // 패킷 스트림 프레임: STX(4B BE) + LEN(4B BE) + payload(LEN) + ETX(4B BE)
+  constexpr uint32_t kStx = 0xA0B0C0D0u;
+  constexpr uint32_t kEtx = 0xD0C0B0A0u;
+  // 비정상 LEN으로 인한 과도한 메모리 할당 방지 (페이로드 상한)
+  constexpr size_t kMaxPayload = 512u * 1024u * 1024u; // 512 MB
 
+  auto readBE32 = [](const uint8_t *p) -> uint32_t {
+    return (static_cast<uint32_t>(p[0]) << 24U) |
+           (static_cast<uint32_t>(p[1]) << 16U) |
+           (static_cast<uint32_t>(p[2]) << 8U) | static_cast<uint32_t>(p[3]);
+  };
+
+  std::vector<uint8_t> payload;
+
+  while (!stopRequested_) {
+    TcpReceiver client;
+    std::string error;
+
+    SetStatus("Connecting to " + config.ip + ":" + std::to_string(config.port));
+    if (!client.Connect(config.ip, config.port, 1000, error)) {
+      // 접속 실패 시 잠시 대기 후 재시도 (loop가 켜진 경우)
+      SetStatus("Connect failed, retrying", error);
+      if (!config.loop) {
+        break;
+      }
+      for (int i = 0; i < 10 && !stopRequested_; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      continue;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.connected = true;
+      snapshot_.listening = false;
+      snapshot_.status = "Connected, receiving";
+      // 재접속 시 carry-over 바이트 리셋 (새 스트림 시작)
+      remainderBytes_.clear();
+    }
+
+    bool protocolError = false;
     while (!stopRequested_) {
-        TcpReceiver client;
-        std::string error;
+      // 헤더: STX(4) + LEN(4)
+      uint8_t header[8];
+      if (!RecvExact(client, header, sizeof(header), error)) {
+        break;
+      }
+      const uint32_t stx = readBE32(header);
+      const uint32_t len = readBE32(header + 4);
+      if (stx != kStx) {
+        error = "STX mismatch";
+        protocolError = true;
+        break;
+      }
+      if (len == 0 || len > kMaxPayload) {
+        error = "Invalid payload length " + std::to_string(len);
+        protocolError = true;
+        break;
+      }
 
-        SetStatus("Connecting to " + config.ip + ":" + std::to_string(config.port));
-        if (!client.Connect(config.ip, config.port, 1000, error)) {
-            // 접속 실패 시 잠시 대기 후 재시도 (loop가 켜진 경우)
-            SetStatus("Connect failed, retrying", error);
-            if (!config.loop) {
-                break;
-            }
-            for (int i = 0; i < 10 && !stopRequested_; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            continue;
-        }
+      // 페이로드: LEN bytes
+      payload.resize(len);
+      if (!RecvExact(client, payload.data(), len, error)) {
+        break;
+      }
 
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            snapshot_.connected = true;
-            snapshot_.listening = false;
-            snapshot_.status = "Connected, receiving";
-            // 재접속 시 carry-over 바이트 리셋 (새 스트림 시작)
-            remainderBytes_.clear();
-        }
+      // 푸터: ETX(4)
+      uint8_t footer[4];
+      if (!RecvExact(client, footer, sizeof(footer), error)) {
+        break;
+      }
+      if (readBE32(footer) != kEtx) {
+        error = "ETX mismatch";
+        protocolError = true;
+        break;
+      }
 
-        while (!stopRequested_) {
-            const int n = client.Recv(buffer.data(), static_cast<int>(buffer.size()), 200, error);
-            if (n == -2) {
-                continue; // 타임아웃: stop 여부 재확인
-            }
-            if (n <= 0) {
-                // 0 = 서버 종료, <0 = 오류
-                std::lock_guard<std::mutex> lock(mutex_);
-                snapshot_.connected = false;
-                snapshot_.status = (n == 0) ? "Server closed connection" : "Receive error";
-                if (n < 0) snapshot_.error = error;
-                break;
-            }
+      // 캡처 중이면 STX/ETX를 제외한 payload만 파일로 기록
+      WriteCapture(payload.data(), payload.size());
 
-            std::vector<uint8_t> packet(buffer.begin(), buffer.begin() + n);
-            AppendSamples(packet, config);
+      AppendSamples(payload, config);
 
-            std::lock_guard<std::mutex> lock(mutex_);
-            snapshot_.bytesSent += static_cast<uint64_t>(n);
-            snapshot_.packetsSent += 1;
-        }
-
-        client.Close();
-
-        if (!config.loop) {
-            break;
-        }
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.bytesSent += static_cast<uint64_t>(len);
+      snapshot_.packetsSent += 1;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshot_.running = false;
-    snapshot_.connected = false;
-    snapshot_.listening = false;
-    if (snapshot_.error.empty()) {
-        snapshot_.status = "Stopped";
+    client.Close();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.connected = false;
+      if (protocolError) {
+        snapshot_.status = "Protocol error";
+        snapshot_.error = error;
+      } else if (!stopRequested_) {
+        // RecvExact 실패(연결 종료/오류)
+        snapshot_.status = error.empty() ? "Disconnected" : error;
+        if (!error.empty()) {
+          snapshot_.error = error;
+        }
+      }
     }
+
+    if (!config.loop) {
+      break;
+    }
+    // 프로토콜 오류 시 잠시 대기 후 재접속 (재시도 폭주 방지)
+    if (protocolError) {
+      for (int i = 0; i < 10 && !stopRequested_; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  snapshot_.streamRunning = false;
+  snapshot_.connected = false;
+  snapshot_.listening = false;
+  if (snapshot_.error.empty()) {
+    snapshot_.status = "Stopped";
+  }
 }
