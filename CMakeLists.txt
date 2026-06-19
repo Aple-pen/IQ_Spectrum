@@ -74,9 +74,12 @@ target_link_libraries(implot_backend PUBLIC imgui_backend)
 
 add_executable(BinTcpSpectrum
     src/App.cpp
+    src/IqStream.cpp
     src/BinStreamer.cpp
+    src/IqReceiver.cpp
     src/Fft.cpp
     src/TcpSender.cpp
+    src/TcpReceiver.cpp
     src/main.cpp
 )
 
