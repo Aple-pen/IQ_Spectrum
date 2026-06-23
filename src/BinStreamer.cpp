@@ -48,7 +48,10 @@ void BinStreamer::Run(StreamConfig config) {
     snapshot_.status = "Listening (spectrum active)";
   }
 
-  std::vector<uint8_t> buffer(static_cast<size_t>(config.chunkBytes));
+  const size_t defaultChunkBytes =
+      static_cast<size_t>(std::max(config.chunkBytes, 1));
+  size_t activeChunkBytes = defaultChunkBytes;
+  std::vector<uint8_t> buffer(activeChunkBytes);
   while (!stopRequested_) {
     std::ifstream file(config.filePath, std::ios::binary);
     if (!file) {
@@ -59,9 +62,33 @@ void BinStreamer::Run(StreamConfig config) {
     while (!stopRequested_ && file) {
       if (!sender.IsConnected()) {
         if (sender.WaitForClient(1, error)) {
+          int requestedChunkBytes = config.chunkBytes;
+          std::string handshakeError;
+          const bool hasChunkRequest = sender.TryRecvChunkRequest(
+              20, 250, requestedChunkBytes, handshakeError);
+          if (!handshakeError.empty()) {
+            sender.DisconnectClient();
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot_.connected = false;
+            snapshot_.status = "Client handshake failed";
+            snapshot_.error = handshakeError;
+            activeChunkBytes = defaultChunkBytes;
+            buffer.resize(activeChunkBytes);
+            continue;
+          }
+
+          activeChunkBytes =
+              hasChunkRequest
+                  ? static_cast<size_t>(std::max(requestedChunkBytes, 1))
+                  : defaultChunkBytes;
+          buffer.resize(activeChunkBytes);
+
           std::lock_guard<std::mutex> lock(mutex_);
           snapshot_.connected = true;
-          snapshot_.status = "Client connected, streaming";
+          snapshot_.error.clear();
+          snapshot_.status = hasChunkRequest
+                                 ? "Client connected, negotiated streaming"
+                                 : "Client connected, streaming";
         } else if (!error.empty()) {
           SetStatus("Accept failed", error);
           stopRequested_ = true;
@@ -82,6 +109,8 @@ void BinStreamer::Run(StreamConfig config) {
       if (sender.IsConnected()) {
         if (!sender.SendAll(packet, error)) {
           sender.DisconnectClient();
+          activeChunkBytes = defaultChunkBytes;
+          buffer.resize(activeChunkBytes);
           std::lock_guard<std::mutex> lock(mutex_);
           snapshot_.connected = false;
           snapshot_.status = "Client disconnected, spectrum-only";

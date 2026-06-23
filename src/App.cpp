@@ -13,6 +13,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -136,9 +137,8 @@ int PushImGuiTheme(bool dark) {
 }
 
 const char *FrequencyName(int index) {
-  static const char *kNames[] = {"915 MHz",      "433 MHz",
-                                 "5.8 GHz_Low",  "5.8 GHz_Mid",
-                                 "5.8 GHz_High", "2.4 GHz Low",
+  static const char *kNames[] = {"915 MHz",     "433 MHz",      "5.8 GHz_Low",
+                                 "5.8 GHz_Mid", "5.8 GHz_High", "2.4 GHz Low",
                                  "2.4 GHz High"};
   if (index < 0 || index >= 7) {
     return "unknown";
@@ -324,6 +324,7 @@ void App::Render() {
 StreamConfig App::BuildConfig() const {
   StreamConfig config;
   config.filePath = filePath_.data();
+  const bool receiveMode = (mode_ == static_cast<int>(Mode::Receive));
   if (mode_ == static_cast<int>(Mode::Receive)) {
     config.ip = serverIp_.data();
     config.port = static_cast<uint16_t>(std::clamp(serverPort_, 1, 65535));
@@ -332,7 +333,6 @@ StreamConfig App::BuildConfig() const {
     config.port = static_cast<uint16_t>(std::clamp(port_, 1, 65535));
   }
   config.fftSize = fftSize_;
-  config.chunkBytes = chunkBytes_;
   config.sendIntervalMs = sendIntervalMs_;
   config.sampleRateHz = sampleRateHz_;
   config.loop = loop_;
@@ -341,6 +341,15 @@ StreamConfig App::BuildConfig() const {
   config.channelIndex =
       std::max(0, std::min(channelIndex_, config.channels - 1));
   config.frequencyIndex = frequencyIndex_;
+  if (receiveMode) {
+    const size_t autoChunkBytes = MinChunkBytesForFft(config);
+    config.chunkBytes =
+        autoChunkBytes > static_cast<size_t>(std::numeric_limits<int>::max())
+            ? std::numeric_limits<int>::max()
+            : static_cast<int>(autoChunkBytes);
+  } else {
+    config.chunkBytes = chunkBytes_;
+  }
   return config;
 }
 
@@ -453,15 +462,13 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
 
     ImGui::Separator();
     ImGui::TextColored(accent, "Stream");
-    // recv 버퍼 크기는 MB 단위로 입력 받아 내부적으로 바이트(chunkBytes_)로
-    // 환산
-    constexpr int32_t kBytesPerMb = 1024 * 1024;
-    int32_t recvBufMb = static_cast<int32_t>(chunkBytes_) / kBytesPerMb;
-    if (ImGui::InputInt("Recv buf (MB)", &recvBufMb)) {
-      int bytes = static_cast<int>(recvBufMb * kBytesPerMb + 0.5f);
-      if (bytes < 1024)
-        bytes = 1024; // 최소 1KB
-      chunkBytes_ = bytes;
+    const StreamConfig autoConfig = BuildConfig();
+    const size_t autoChunkBytes = MinChunkBytesForFft(autoConfig);
+    ImGui::Text("Auto recv bytes: %zu", autoChunkBytes);
+    if (sampleRateHz_ > 0.0f) {
+      const float fftWindowMs =
+          1000.0f * static_cast<float>(fftSize_) / sampleRateHz_;
+      ImGui::TextColored(infoColor, "1 FFT window: %.3f ms", fftWindowMs);
     }
     ImGui::Checkbox("Auto-reconnect", &loop_);
   }

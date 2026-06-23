@@ -30,6 +30,26 @@ struct StreamConfig {
   int frequencyIndex = 0; // IQ heterodyne offset (shifts spectrum center)
 };
 
+inline size_t BytesPerScalarSample(SampleFormat sampleFormat) {
+  switch (sampleFormat) {
+  case SampleFormat::UInt8:
+    return 1;
+  case SampleFormat::Int16LE:
+    return 2;
+  case SampleFormat::Float32LE:
+    return 4;
+  }
+  return 1;
+}
+
+inline size_t MinChunkBytesForFft(const StreamConfig &config) {
+  const size_t fftSize =
+      static_cast<size_t>(config.fftSize > 0 ? config.fftSize : 1);
+  const size_t channels =
+      static_cast<size_t>(config.channels > 0 ? config.channels : 1);
+  return fftSize * channels * BytesPerScalarSample(config.sampleFormat);
+}
+
 struct StreamSnapshot {
   bool streamRunning = false;
   bool captureActive = false;
