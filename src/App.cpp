@@ -474,6 +474,14 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   }
 
   ImGui::Separator();
+  ImGui::TextColored(accent, "Y Axis");
+  ImGui::Checkbox("Auto scale", &yAxisAuto_);
+  if (!yAxisAuto_) {
+    ImGui::InputFloat("Y min (dB)", &yAxisMin_);
+    ImGui::InputFloat("Y max (dB)", &yAxisMax_);
+  }
+
+  ImGui::Separator();
   ImGui::TextColored(accent, "FFT");
   {
     static const int kFftSizes[] = {256, 512, 1024, 2048, 4096, 8192, 16384};
@@ -562,14 +570,6 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   ImGui::SameLine();
   if (ImGui::Button("White", ImVec2(80, 24))) {
     chartDark_ = false;
-  }
-
-  ImGui::Separator();
-  ImGui::TextColored(accent, "Y Axis");
-  ImGui::Checkbox("Auto scale", &yAxisAuto_);
-  if (!yAxisAuto_) {
-    ImGui::InputFloat("Y min (dB)", &yAxisMin_);
-    ImGui::InputFloat("Y max (dB)", &yAxisMax_);
   }
 
   ImGui::Separator();
