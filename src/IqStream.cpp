@@ -10,6 +10,9 @@
 #include <system_error>
 
 namespace {
+// channels == 1(원신호) 모드에서 int8 값에 적용하는 고정 DC offset.
+constexpr int kMonoDcOffset = 70;
+
 float ReadFloat32LE(const uint8_t *bytes) {
   uint32_t value = static_cast<uint32_t>(bytes[0]) |
                    (static_cast<uint32_t>(bytes[1]) << 8U) |
@@ -163,26 +166,32 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
       snapshot_.fftFrameCount += 1;
     }
   } else {
-    // Real-only FFT fallback (mono)
-    sampleBuffer_.insert(sampleBuffer_.end(), parsed.begin(), parsed.end());
+    // channels == 1: FFT를 하지 않고 원신호(int8) 값을 그대로 그린다 (시간영역
+    // 파형). 값은 정규화하지 않고 int8(-128..127)에서 DC offset(-70)만 뺀 고정
+    // 스케일을 사용한다.
+    // 참고 python: v = np.fromfile(..., dtype=np.int8) - 70; plt.plot(x, v)
+    for (size_t frame = 0; frame < totalFrames; ++frame) {
+      const size_t idx = frame * bytesPerFrame +
+                         static_cast<size_t>(channelIdx) * bytesPerSample;
+      const int raw = static_cast<int>(static_cast<int8_t>(buf[idx]));
+      sampleBuffer_.push_back(static_cast<float>(raw - kMonoDcOffset));
+    }
     if (sampleBuffer_.size() > maxSamples)
       sampleBuffer_.erase(sampleBuffer_.begin(),
                           sampleBuffer_.end() -
                               static_cast<std::ptrdiff_t>(maxSamples));
 
     if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
-      snapshot_.magnitudesDb = Fft::MagnitudeSpectrum(
-          sampleBuffer_, config.fftSize, config.sampleRateHz);
-      std::rotate(snapshot_.magnitudesDb.begin(),
-                  snapshot_.magnitudesDb.begin() +
-                      snapshot_.magnitudesDb.size() / 2,
-                  snapshot_.magnitudesDb.end());
-      const int N = static_cast<int>(snapshot_.magnitudesDb.size());
-      snapshot_.frequencies.resize(static_cast<size_t>(N));
-      for (int k = 0; k < N; ++k) {
-        snapshot_.frequencies[static_cast<size_t>(k)] =
-            (static_cast<float>(k) * config.sampleRateHz) /
-            static_cast<float>(config.fftSize);
+      const size_t N = static_cast<size_t>(config.fftSize);
+      // 최신 N개 샘플을 그대로 y값으로 사용 (FFT/dB 변환 없음)
+      snapshot_.magnitudesDb.assign(
+          sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N),
+          sampleBuffer_.end());
+      // x축: 0..1 정규화 (python의 linspace(0,1,N)와 동일)
+      snapshot_.frequencies.resize(N);
+      const float denom = N > 1 ? static_cast<float>(N - 1) : 1.0f;
+      for (size_t k = 0; k < N; ++k) {
+        snapshot_.frequencies[k] = static_cast<float>(k) / denom;
       }
       snapshot_.fftFrameCount += 1;
     }
