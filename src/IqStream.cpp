@@ -9,6 +9,7 @@
 
 #include "Fft.h"
 
+
 namespace {
 // channels == 1(원신호) 모드에서 int8 값에 적용하는 고정 DC offset.
 constexpr int kMonoDcOffset = 70;
@@ -79,60 +80,6 @@ void IqStream::Stop() {
 StreamSnapshot IqStream::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return snapshot_;
-}
-void IqStream::SetStatus(const std::string &status, const std::string &error) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshot_.status = status;
-    snapshot_.error  = error;
-}
-
-bool IqStream::StartCapture(const std::string &path, std::string &error) {
-    std::lock_guard<std::mutex> lock(captureMutex_);
-    // path는 "<base>.bin" 형태. 확장자를 떼어 payload 파일들을 담을 디렉터리로
-    // 사용.
-    std::filesystem::path dir(path);
-    if (dir.has_extension()) {
-        dir.replace_extension();
-    }
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        error = "Failed to create capture directory: " + dir.string();
-        return false;
-    }
-    captureDir_   = dir.string();
-    captureIndex_ = 0;
-    capturing_    = true;
-    {
-        std::lock_guard<std::mutex> snapLock(mutex_);
-        snapshot_.captureActive = true;
-    }
-    return true;
-}
-
-void IqStream::StopCapture() {
-    std::lock_guard<std::mutex> lock(captureMutex_);
-    capturing_ = false;
-    captureDir_.clear();
-    std::lock_guard<std::mutex> snapLock(mutex_);
-    snapshot_.captureActive = false;
-}
-
-void IqStream::WriteCapture(const uint8_t *data, size_t n) {
-    std::lock_guard<std::mutex> lock(captureMutex_);
-    if (!capturing_ || n == 0) {
-        return;
-    }
-    // STX/ETX 프레임 1개의 payload를 인덱스 파일 1개로 저장.
-    ++captureIndex_;
-    char name[32];
-    std::snprintf(name, sizeof(name), "%06llu.bin", static_cast<unsigned long long>(captureIndex_));
-    const std::filesystem::path file = std::filesystem::path(captureDir_) / name;
-    std::ofstream               out(file, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return;  // 개별 파일 열기 실패는 캡처 전체를 멈추지 않음
-    }
-    out.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(n));
 }
 
 void IqStream::AppendSamples(const std::vector<uint8_t> &bytes, const StreamConfig &config) {
@@ -229,55 +176,65 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes, const StreamConf
             iBuf.push_back(readSample(buf.data() + frameBase));
             qBuf.push_back(readSample(buf.data() + frameBase + bytesPerSample));
         }
-        const size_t bytesPerFrame = bytesPerSample * static_cast<size_t>(channels);  // 1프레임 = 모든 채널
+    }
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        // 나머지 바이트 저장 (carry-over)
-        if (hmftMode) {
-            // HMFT 모드: 헤더 단위로 잘린 미완성 프레임을 이월 (payload는 2048의 배수라
-            // 샘플 단위 잔여는 없음).
-            remainderBytes_ = std::move(hmftCarry);
-        } else {
-            remainderBytes_.assign(buf.begin() + static_cast<std::ptrdiff_t>(usedBytes), buf.end());
-        }
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 나머지 바이트 저장 (carry-over)
+    if (hmftMode) {
+        // HMFT 모드: 헤더 단위로 잘린 미완성 프레임을 이월 (payload는 2048의 배수라
+        // 샘플 단위 잔여는 없음).
+        remainderBytes_ = std::move(hmftCarry);
+    } else {
+        remainderBytes_.assign(buf.begin() + static_cast<std::ptrdiff_t>(usedBytes), buf.end());
+    }
 
-        // 파싱한 HMFT 헤더 정보를 스냅샷에 반영 (UI 표시용)
-        if (hmftMode && hmftAny) {
-            snapshot_.hmftValid     = true;
-            snapshot_.hmftSeq       = hmftSeq;
-            snapshot_.hmftBwCode    = static_cast<int>((hmftHigh >> 29U) & 0x7U);
-            snapshot_.hmftCenterKHz = hmftHigh & 0x1FFFFFFFU;
-        }
+    // 파싱한 HMFT 헤더 정보를 스냅샷에 반영 (UI 표시용)
+    if (hmftMode && hmftAny) {
+        snapshot_.hmftValid     = true;
+        snapshot_.hmftSeq       = hmftSeq;
+        snapshot_.hmftBwCode    = static_cast<int>((hmftHigh >> 29U) & 0x7U);
+        snapshot_.hmftCenterKHz = hmftHigh & 0x1FFFFFFFU;
+    }
 
-        // 완전한 프레임 수 계산
-        const size_t totalFrames = buf.size() / bytesPerFrame;
-        const size_t usedBytes   = totalFrames * bytesPerFrame;
+    if (parsed.empty()) {
+        return;
+    }
 
-        std::vector<float> parsed;
-        parsed.reserve(totalFrames);
+    const size_t maxSamples = static_cast<size_t>(config.fftSize * 4);
 
-        // IQ constellation: extract I(ch0) and Q(ch1) when 2+ channels available
-        const bool         hasIQ = channels >= 2;
-        std::vector<float> iBuf, qBuf;
-        // Always attempt IQ extraction if at least 2 samples per frame are available
-        const bool canExtractIQ = bytesPerFrame >= bytesPerSample * 2;
-        iBuf.reserve(totalFrames);
-        qBuf.reserve(totalFrames);
-
-        auto readSample = [&](const uint8_t *ptr) -> float {
-            if (config.sampleFormat == SampleFormat::UInt8) return (static_cast<float>(*ptr) - 128.0f) / 128.0f;
-            if (config.sampleFormat == SampleFormat::Int16LE) return static_cast<float>(ReadInt16LE(ptr)) / 32768.0f;
-            return ReadFloat32LE(ptr);
+    if (hasIQ) {
+        // IQ complex FFT path: accumulate I and Q separately
+        auto trimAppend = [&](std::vector<float> &dst, const std::vector<float> &src) {
+            dst.insert(dst.end(), src.begin(), src.end());
+            if (dst.size() > maxSamples) dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(maxSamples));
         };
+        trimAppend(iSampleBuffer_, iBuf);
+        trimAppend(qSampleBuffer_, qBuf);
 
-        for (size_t frame = 0; frame < totalFrames; ++frame) {
-            const size_t frameBase = frame * bytesPerFrame;
-            parsed.push_back(readSample(buf.data() + frameBase + static_cast<size_t>(channelIdx) * bytesPerSample));
-            if (canExtractIQ) {
-                iBuf.push_back(readSample(buf.data() + frameBase));
-                qBuf.push_back(readSample(buf.data() + frameBase + bytesPerSample));
+        if (static_cast<int>(iSampleBuffer_.size()) >= config.fftSize) {
+            const float freqOffset = freqOffsetHz_.load(std::memory_order_relaxed);
+            snapshot_.magnitudesDb = Fft::MagnitudeSpectrumIQ(iSampleBuffer_, qSampleBuffer_, config.fftSize,
+                                                              config.sampleRateHz, freqOffset);
+            const int N            = static_cast<int>(snapshot_.magnitudesDb.size());
+            snapshot_.frequencies.resize(static_cast<size_t>(N));
+            for (int k = 0; k < N; ++k) {
+                snapshot_.frequencies[static_cast<size_t>(k)] =
+                    (static_cast<float>(k - N / 2) * config.sampleRateHz) / static_cast<float>(N);
             }
+            snapshot_.fftFrameCount += 1;
         }
+    } else {
+        // channels == 1: FFT를 하지 않고 원신호(int8) 값을 그대로 그린다 (시간영역
+        // 파형). 값은 정규화하지 않고 int8(-128..127)에서 DC offset(-70)만 뺀 고정
+        // 스케일을 사용한다.
+        // 참고 python: v = np.fromfile(..., dtype=np.int8) - 70; plt.plot(x, v)
+        for (size_t frame = 0; frame < totalFrames; ++frame) {
+            const size_t idx = frame * bytesPerFrame + static_cast<size_t>(channelIdx) * bytesPerSample;
+            const int    raw = static_cast<int>(static_cast<int8_t>(buf[idx]));
+            sampleBuffer_.push_back(static_cast<float>(raw - kMonoDcOffset));
+        }
+        if (sampleBuffer_.size() > maxSamples)
+            sampleBuffer_.erase(sampleBuffer_.begin(), sampleBuffer_.end() - static_cast<std::ptrdiff_t>(maxSamples));
 
         if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
             const size_t N = static_cast<size_t>(config.fftSize);
@@ -304,76 +261,71 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes, const StreamConf
             }
             snapshot_.fftFrameCount += 1;
         }
-
-        if (hasIQ) {
-            const size_t maxSamples = static_cast<size_t>(config.fftSize * 4);
-            // IQ complex FFT path: accumulate I and Q separately
-            auto trimAppend = [&](std::vector<float> &dst, const std::vector<float> &src) {
-                dst.insert(dst.end(), src.begin(), src.end());
-                if (dst.size() > maxSamples)
-                    dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(maxSamples));
-            };
-            trimAppend(iSampleBuffer_, iBuf);
-            trimAppend(qSampleBuffer_, qBuf);
-
-            if (static_cast<int>(iSampleBuffer_.size()) >= config.fftSize) {
-                const float freqOffset = freqOffsetHz_.load(std::memory_order_relaxed);
-                snapshot_.magnitudesDb = Fft::MagnitudeSpectrumIQ(iSampleBuffer_, qSampleBuffer_, config.fftSize,
-                                                                  config.sampleRateHz, freqOffset);
-                const int N            = static_cast<int>(snapshot_.magnitudesDb.size());
-                snapshot_.frequencies.resize(static_cast<size_t>(N));
-                for (int k = 0; k < N; ++k) {
-                    snapshot_.frequencies[static_cast<size_t>(k)] =
-                        (static_cast<float>(k - N / 2) * config.sampleRateHz) / static_cast<float>(N);
-                }
-                snapshot_.fftFrameCount += 1;
-            }
-        } else {
-            // channels == 1: FFT를 하지 않고 원신호(int8) 값을 그대로 그린다 (시간영역
-            // 파형). 값은 정규화하지 않고 int8(-128..127)에서 DC offset(-70)만 뺀 고정
-            // 스케일을 사용한다.
-            // 참고 python: v = np.fromfile(..., dtype=np.int8) - 70; plt.plot(x, v)
-
-            // ***** 광대역 스캐너 정책 *****
-            // **[16바이트 헤더 + 2048 byte per frame]**
-            // MagicNumber : 4byte (0x484D4654 'HMFT')
-            // Sequence Counter : 4byte (DMA fifo reset 되면 0으로 초기화)
-            // user space : 4byte ([31~29]상위 3bit :Scan 대역폭, [28~0] 29bit: 현재 Center 주파수(khz단위))
-            // reserved : 4byte (0x00000000)
-            const size_t maxSamples = static_cast<size_t>(config.fftSize + 16);
-            for (size_t frame = 0; frame < totalFrames; ++frame) {
-                const size_t idx = frame * bytesPerFrame + static_cast<size_t>(channelIdx) * bytesPerSample;
-                const int    raw = static_cast<int>(static_cast<int8_t>(buf[idx]));
-                sampleBuffer_.push_back(static_cast<float>(raw - kMonoDcOffset));
-            }
-            if (sampleBuffer_.size() > maxSamples)
-                sampleBuffer_.erase(sampleBuffer_.begin(),
-                                    sampleBuffer_.end() - static_cast<std::ptrdiff_t>(maxSamples));
-
-            if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize + 16) {
-                const size_t N = static_cast<size_t>(config.fftSize + 16);
-                // 최신 N개 샘플을 그대로 y값으로 사용 (FFT/dB 변환 없음)
-                snapshot_.magnitudesDb.assign(sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N),
-                                              sampleBuffer_.end());
-                // x축: 0..1 정규화 (python의 linspace(0,1,N)와 동일)
-                snapshot_.frequencies.resize(N);
-                const float denom = N > 1 ? static_cast<float>(N - 1) : 1.0f;
-                for (size_t k = 0; k < N; ++k) {
-                    snapshot_.frequencies[k] = static_cast<float>(k) / denom;
-                }
-                snapshot_.fftFrameCount += 1;
-            }
-        }
-
-        // Constellation: always update if IQ bytes were available
-        if (canExtractIQ && !iBuf.empty()) {
-            const size_t keep           = static_cast<size_t>(config.fftSize);
-            auto         trimAppendSnap = [&](std::vector<float> &dst, const std::vector<float> &src) {
-                dst.insert(dst.end(), src.begin(), src.end());
-                if (dst.size() > keep) dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(keep));
-            };
-            trimAppendSnap(snapshot_.iSamples, iBuf);
-            trimAppendSnap(snapshot_.qSamples, qBuf);
-        }
     }
+
+    // Constellation: always update if IQ bytes were available
+    if (canExtractIQ && !iBuf.empty()) {
+        const size_t keep           = static_cast<size_t>(config.fftSize);
+        auto         trimAppendSnap = [&](std::vector<float> &dst, const std::vector<float> &src) {
+            dst.insert(dst.end(), src.begin(), src.end());
+            if (dst.size() > keep) dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(keep));
+        };
+        trimAppendSnap(snapshot_.iSamples, iBuf);
+        trimAppendSnap(snapshot_.qSamples, qBuf);
+    }
+}
+
+void IqStream::SetStatus(const std::string &status, const std::string &error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.status = status;
+    snapshot_.error  = error;
+}
+
+bool IqStream::StartCapture(const std::string &path, std::string &error) {
+    std::lock_guard<std::mutex> lock(captureMutex_);
+    // path는 "<base>.bin" 형태. 확장자를 떼어 payload 파일들을 담을 디렉터리로
+    // 사용.
+    std::filesystem::path dir(path);
+    if (dir.has_extension()) {
+        dir.replace_extension();
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        error = "Failed to create capture directory: " + dir.string();
+        return false;
+    }
+    captureDir_   = dir.string();
+    captureIndex_ = 0;
+    capturing_    = true;
+    {
+        std::lock_guard<std::mutex> snapLock(mutex_);
+        snapshot_.captureActive = true;
+    }
+    return true;
+}
+
+void IqStream::StopCapture() {
+    std::lock_guard<std::mutex> lock(captureMutex_);
+    capturing_ = false;
+    captureDir_.clear();
+    std::lock_guard<std::mutex> snapLock(mutex_);
+    snapshot_.captureActive = false;
+}
+
+void IqStream::WriteCapture(const uint8_t *data, size_t n) {
+    std::lock_guard<std::mutex> lock(captureMutex_);
+    if (!capturing_ || n == 0) {
+        return;
+    }
+    // STX/ETX 프레임 1개의 payload를 인덱스 파일 1개로 저장.
+    ++captureIndex_;
+    char name[32];
+    std::snprintf(name, sizeof(name), "%06llu.bin", static_cast<unsigned long long>(captureIndex_));
+    const std::filesystem::path file = std::filesystem::path(captureDir_) / name;
+    std::ofstream               out(file, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return;  // 개별 파일 열기 실패는 캡처 전체를 멈추지 않음
+    }
+    out.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(n));
 }
