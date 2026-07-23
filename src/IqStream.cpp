@@ -13,6 +13,22 @@ namespace {
 // channels == 1(원신호) 모드에서 int8 값에 적용하는 고정 DC offset.
 constexpr int kMonoDcOffset = 70;
 
+// HMFT 프레임 헤더: 2048 payload마다 앞에 16바이트가 삽입된다 (모두 big-endian).
+//   [0]  4B Magic = "HMFT"(0x484D4654)
+//   [4]  4B Sequence Counter
+//   [8]  4B high user space: bit[31:29]=대역폭 코드, bit[28:0]=Center(kHz)
+//   [12] 4B low user space (reserved)
+constexpr uint32_t kHmftMagic = 0x484D4654u; // "HMFT"
+constexpr size_t kHmftHeaderBytes = 16;
+constexpr size_t kHmftPayloadBytes = 2048;
+
+uint32_t ReadBE32(const uint8_t *bytes) {
+  return (static_cast<uint32_t>(bytes[0]) << 24U) |
+         (static_cast<uint32_t>(bytes[1]) << 16U) |
+         (static_cast<uint32_t>(bytes[2]) << 8U) |
+         static_cast<uint32_t>(bytes[3]);
+}
+
 float ReadFloat32LE(const uint8_t *bytes) {
   uint32_t value = static_cast<uint32_t>(bytes[0]) |
                    (static_cast<uint32_t>(bytes[1]) << 8U) |
@@ -94,6 +110,56 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
   }
   buf.insert(buf.end(), bytes.begin(), bytes.end());
 
+  // HMFT 프레임 헤더 처리: payload 스트림에서 magic("HMFT")을 스캔해 16바이트
+  // 헤더를 벗겨내고 payload(2048B)만 남긴다. chunk 경계로 프레임이 잘려도
+  // remainder로 이월한다. (config.hmftHeader가 꺼져 있으면 buf를 그대로 사용)
+  // HMFT 헤더는 광대역 스캔(1채널) 모드 전용이므로 channels == 1일 때만 적용.
+  const bool hmftMode = config.hmftHeader && channels == 1;
+  std::vector<uint8_t> hmftCarry;
+  bool hmftAny = false;
+  uint32_t hmftSeq = 0;
+  uint32_t hmftHigh = 0;
+  if (hmftMode) {
+    auto matchMagic = [&](size_t i) -> bool {
+      return i + 4 <= buf.size() && ReadBE32(buf.data() + i) == kHmftMagic;
+    };
+    std::vector<uint8_t> payload;
+    payload.reserve(buf.size());
+    size_t pos = 0;
+    while (true) {
+      // pos부터 magic 위치 탐색 (초기 정렬 및 바이트 유실 시 재동기화)
+      size_t m = pos;
+      while (m + 4 <= buf.size() && !matchMagic(m)) {
+        ++m;
+      }
+      if (m + 4 > buf.size()) {
+        // 완전한 magic 없음: 뒤쪽 최대 3바이트(부분 magic 가능성)만 이월
+        const size_t keep = std::min<size_t>(3, buf.size() - pos);
+        hmftCarry.assign(buf.end() - static_cast<std::ptrdiff_t>(keep),
+                         buf.end());
+        break;
+      }
+      if (m + kHmftHeaderBytes + kHmftPayloadBytes > buf.size()) {
+        // 프레임(헤더+payload)이 아직 덜 도착: magic부터 통째로 이월
+        hmftCarry.assign(buf.begin() + static_cast<std::ptrdiff_t>(m),
+                         buf.end());
+        break;
+      }
+      // 헤더 파싱 후 payload(2048B) 추출
+      hmftSeq = ReadBE32(buf.data() + m + 4);
+      hmftHigh = ReadBE32(buf.data() + m + 8);
+      hmftAny = true;
+      const size_t payloadStart = m + kHmftHeaderBytes;
+      payload.insert(
+          payload.end(),
+          buf.begin() + static_cast<std::ptrdiff_t>(payloadStart),
+          buf.begin() +
+              static_cast<std::ptrdiff_t>(payloadStart + kHmftPayloadBytes));
+      pos = payloadStart + kHmftPayloadBytes;
+    }
+    buf = std::move(payload);
+  }
+
   // 완전한 프레임 수 계산
   const size_t totalFrames = buf.size() / bytesPerFrame;
   const size_t usedBytes = totalFrames * bytesPerFrame;
@@ -130,8 +196,22 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
 
   std::lock_guard<std::mutex> lock(mutex_);
   // 나머지 바이트 저장 (carry-over)
-  remainderBytes_.assign(buf.begin() + static_cast<std::ptrdiff_t>(usedBytes),
-                         buf.end());
+  if (hmftMode) {
+    // HMFT 모드: 헤더 단위로 잘린 미완성 프레임을 이월 (payload는 2048의 배수라
+    // 샘플 단위 잔여는 없음).
+    remainderBytes_ = std::move(hmftCarry);
+  } else {
+    remainderBytes_.assign(buf.begin() + static_cast<std::ptrdiff_t>(usedBytes),
+                           buf.end());
+  }
+
+  // 파싱한 HMFT 헤더 정보를 스냅샷에 반영 (UI 표시용)
+  if (hmftMode && hmftAny) {
+    snapshot_.hmftValid = true;
+    snapshot_.hmftSeq = hmftSeq;
+    snapshot_.hmftBwCode = static_cast<int>((hmftHigh >> 29U) & 0x7U);
+    snapshot_.hmftCenterKHz = hmftHigh & 0x1FFFFFFFU;
+  }
 
   if (parsed.empty()) {
     return;
@@ -187,11 +267,27 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
       snapshot_.magnitudesDb.assign(
           sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N),
           sampleBuffer_.end());
-      // x축: 0..1 정규화 (python의 linspace(0,1,N)와 동일)
+      // x축: HMFT 헤더가 있으면 center±BW/2 실제 주파수(MHz)로, 없으면 0..1 정규화.
       snapshot_.frequencies.resize(N);
       const float denom = N > 1 ? static_cast<float>(N - 1) : 1.0f;
-      for (size_t k = 0; k < N; ++k) {
-        snapshot_.frequencies[k] = static_cast<float>(k) / denom;
+      if (hmftMode && hmftAny) {
+        // 대역폭 코드 -> MHz (200M=0,100M=1,20M=2,10M=3,5M=4)
+        static const float kBwMHz[] = {200.0f, 100.0f, 20.0f, 10.0f, 5.0f};
+        const int bwCode = static_cast<int>((hmftHigh >> 29U) & 0x7U);
+        const float bwMHz =
+            (bwCode >= 0 && bwCode < 5) ? kBwMHz[bwCode] : 1.0f;
+        const float centerMHz =
+            static_cast<float>(hmftHigh & 0x1FFFFFFFU) / 1000.0f;
+        const float startMHz = centerMHz - bwMHz * 0.5f;
+        for (size_t k = 0; k < N; ++k) {
+          snapshot_.frequencies[k] =
+              startMHz + bwMHz * static_cast<float>(k) / denom;
+        }
+      } else {
+        // python의 linspace(0,1,N)와 동일
+        for (size_t k = 0; k < N; ++k) {
+          snapshot_.frequencies[k] = static_cast<float>(k) / denom;
+        }
       }
       snapshot_.fftFrameCount += 1;
     }
