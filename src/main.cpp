@@ -1,12 +1,13 @@
-#include "App.h"
-
+#include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <implot.h>
-#include <GLFW/glfw3.h>
 
 #include <cstdio>
+
+#include "App.h"
+
 
 int main() {
     if (!glfwInit()) {
@@ -51,7 +52,7 @@ int main() {
         app.Render();
 
         ImGui::Render();
-        int displayWidth = 0;
+        int displayWidth  = 0;
         int displayHeight = 0;
         glfwGetFramebufferSize(window, &displayWidth, &displayHeight);
         glViewport(0, 0, displayWidth, displayHeight);
@@ -86,6 +87,6 @@ int main() {
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window);
-    glfwTerminate(); 
+    glfwTerminate();
     return 0;
 }
