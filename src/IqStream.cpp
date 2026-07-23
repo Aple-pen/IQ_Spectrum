@@ -126,9 +126,8 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes, const StreamConf
         return;
     }
 
-    const size_t maxSamples = static_cast<size_t>(config.fftSize * 4);
-
     if (hasIQ) {
+        const size_t maxSamples = static_cast<size_t>(config.fftSize * 4);
         // IQ complex FFT path: accumulate I and Q separately
         auto trimAppend = [&](std::vector<float> &dst, const std::vector<float> &src) {
             dst.insert(dst.end(), src.begin(), src.end());
@@ -154,6 +153,14 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes, const StreamConf
         // 파형). 값은 정규화하지 않고 int8(-128..127)에서 DC offset(-70)만 뺀 고정
         // 스케일을 사용한다.
         // 참고 python: v = np.fromfile(..., dtype=np.int8) - 70; plt.plot(x, v)
+
+        // ***** 광대역 스캐너 정책 *****
+        // **[16바이트 헤더 + 2048 byte per frame]**
+        // MagicNumber : 4byte (0x484D4654 'HMFT')
+        // Sequence Counter : 4byte (DMA fifo reset 되면 0으로 초기화)
+        // user space : 4byte ([31~29]상위 3bit :Scan 대역폭, [28~0] 29bit: 현재 Center 주파수(khz단위))
+        // reserved : 4byte (0x00000000)
+        const size_t maxSamples = static_cast<size_t>(config.fftSize + 16);
         for (size_t frame = 0; frame < totalFrames; ++frame) {
             const size_t idx = frame * bytesPerFrame + static_cast<size_t>(channelIdx) * bytesPerSample;
             const int    raw = static_cast<int>(static_cast<int8_t>(buf[idx]));
@@ -162,8 +169,10 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes, const StreamConf
         if (sampleBuffer_.size() > maxSamples)
             sampleBuffer_.erase(sampleBuffer_.begin(), sampleBuffer_.end() - static_cast<std::ptrdiff_t>(maxSamples));
 
-        if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
-            const size_t N = static_cast<size_t>(config.fftSize);
+        if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize + 16) {
+            const size_t N = static_cast<size_t>(config.fftSize + 16);
+            snapshot_.wideHeader.assign(sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N),
+                                        sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N - 16));
             // 최신 N개 샘플을 그대로 y값으로 사용 (FFT/dB 변환 없음)
             snapshot_.magnitudesDb.assign(sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N), sampleBuffer_.end());
             // x축: 0..1 정규화 (python의 linspace(0,1,N)와 동일)

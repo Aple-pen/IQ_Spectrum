@@ -49,19 +49,21 @@ inline size_t MinChunkBytesForFft(const StreamConfig &config) {
 }
 
 struct StreamSnapshot {
-    bool               streamRunning = false;
-    bool               captureActive = false;
-    bool               connected     = false;
-    bool               listening     = false;
-    uint64_t           bytesSent     = 0;  // 서버: 전송 / 수신: 수신 바이트 (모드별 의미)
-    uint64_t           packetsSent   = 0;  // 서버: 전송 / 수신: 수신 패킷 (모드별 의미)
-    uint64_t           fftFrameCount = 0;
-    std::string        status        = "Idle";
-    std::string        error;
-    std::vector<float> frequencies;
-    std::vector<float> magnitudesDb;
-    std::vector<float> iSamples;  // recent I samples (constellation)
-    std::vector<float> qSamples;  // recent Q samples (constellation)
+    bool     streamRunning = false;
+    bool     captureActive = false;
+    bool     connected     = false;
+    bool     listening     = false;
+    uint64_t bytesSent     = 0;  // 서버: 전송 / 수신: 수신 바이트 (모드별 의미)
+    uint64_t packetsSent   = 0;  // 서버: 전송 / 수신: 수신 패킷 (모드별 의미)
+    uint64_t fftFrameCount = 0;
+
+    std::string          status = "Idle";
+    std::string          error;
+    std::vector<int32_t> wideHeader;  // 광대역 스캐너 헤더 (4개 int32)
+    std::vector<float>   frequencies;
+    std::vector<float>   magnitudesDb;
+    std::vector<float>   iSamples;  // recent I samples (constellation)
+    std::vector<float>   qSamples;  // recent Q samples (constellation)
 };
 
 // 재생(BinStreamer)과 실시간 수신(IqReceiver)이 공유하는 베이스 클래스.
