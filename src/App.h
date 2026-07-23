@@ -8,7 +8,6 @@
 #include "BinStreamer.h"
 #include "IqReceiver.h"
 
-
 class App {
    public:
     void Render();
@@ -40,6 +39,7 @@ class App {
     int                   frequencyIndex_      = 0;
     int                   channels_            = 1;
     int                   channelIndex_        = 0;
+    bool                  hmftHeader_          = false;  // payload에 2048당 16B HMFT 헤더 삽입 여부
     bool                  showDemo_            = false;
     bool                  chartDark_           = true;
     bool                  yAxisAuto_           = true;

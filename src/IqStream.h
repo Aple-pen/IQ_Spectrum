@@ -28,6 +28,9 @@ struct StreamConfig {
     int          channels       = 1;  // 총 채널 수 (1=mono, 2=stereo/IQ)
     int          channelIndex   = 0;  // 사용할 채널 인덱스 (0-based)
     int          frequencyIndex = 0;  // IQ heterodyne offset (shifts spectrum center)
+    // true면 payload 스트림에 2048 payload마다 16바이트 HMFT 헤더가 삽입되어
+    // 있다고 보고, magic("HMFT")을 스캔해 헤더를 벗겨낸 뒤 payload만 파싱한다.
+    bool hmftHeader = false;
 };
 
 inline size_t BytesPerScalarSample(SampleFormat sampleFormat) {
@@ -49,21 +52,25 @@ inline size_t MinChunkBytesForFft(const StreamConfig &config) {
 }
 
 struct StreamSnapshot {
-    bool     streamRunning = false;
-    bool     captureActive = false;
-    bool     connected     = false;
-    bool     listening     = false;
-    uint64_t bytesSent     = 0;  // 서버: 전송 / 수신: 수신 바이트 (모드별 의미)
-    uint64_t packetsSent   = 0;  // 서버: 전송 / 수신: 수신 패킷 (모드별 의미)
-    uint64_t fftFrameCount = 0;
+    bool               streamRunning = false;
+    bool               captureActive = false;
+    bool               connected     = false;
+    bool               listening     = false;
+    uint64_t           bytesSent     = 0;  // 서버: 전송 / 수신: 수신 바이트 (모드별 의미)
+    uint64_t           packetsSent   = 0;  // 서버: 전송 / 수신: 수신 패킷 (모드별 의미)
+    uint64_t           fftFrameCount = 0;
+    std::string        status        = "Idle";
+    std::string        error;
+    std::vector<float> frequencies;
+    std::vector<float> magnitudesDb;
+    std::vector<float> iSamples;  // recent I samples (constellation)
+    std::vector<float> qSamples;  // recent Q samples (constellation)
 
-    std::string          status = "Idle";
-    std::string          error;
-    std::vector<int32_t> wideHeader;  // 광대역 스캐너 헤더 (4개 int32)
-    std::vector<float>   frequencies;
-    std::vector<float>   magnitudesDb;
-    std::vector<float>   iSamples;  // recent I samples (constellation)
-    std::vector<float>   qSamples;  // recent Q samples (constellation)
+    // 최근 파싱한 HMFT 헤더 정보 (config.hmftHeader가 켜진 경우에만 갱신).
+    bool     hmftValid     = false;  // 유효한 헤더를 1개 이상 파싱했는지
+    uint32_t hmftSeq       = 0;      // 마지막 프레임의 Sequence Counter
+    int      hmftBwCode    = 0;      // 대역폭 코드 (0=200M,1=100M,2=20M,3=10M,4=5M)
+    uint32_t hmftCenterKHz = 0;      // Center 주파수 (kHz)
 };
 
 // 재생(BinStreamer)과 실시간 수신(IqReceiver)이 공유하는 베이스 클래스.

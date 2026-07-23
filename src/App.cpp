@@ -167,6 +167,8 @@ void App::LoadSettings(const char *path) {
             channels_ = std::stoi(val);
         } else if (key == "channelIndex") {
             channelIndex_ = std::stoi(val);
+        } else if (key == "hmftHeader") {
+            hmftHeader_ = val == "1";
         } else if (key == "chartDark") {
             chartDark_ = val == "1";
         } else if (key == "yAxisAuto") {
@@ -209,6 +211,7 @@ void App::SaveSettings(const char *path) const {
     f << "sampleFormatIndex=" << sampleFormatIndex_ << '\n';
     f << "channels=" << channels_ << '\n';
     f << "channelIndex=" << channelIndex_ << '\n';
+    f << "hmftHeader=" << (hmftHeader_ ? 1 : 0) << '\n';
     f << "chartDark=" << (chartDark_ ? 1 : 0) << '\n';
     f << "yAxisAuto=" << (yAxisAuto_ ? 1 : 0) << '\n';
     f << "yAxisMin=" << yAxisMin_ << '\n';
@@ -281,6 +284,7 @@ StreamConfig App::BuildConfig() const {
     config.channels       = std::max(1, channels_);
     config.channelIndex   = std::max(0, std::min(channelIndex_, config.channels - 1));
     config.frequencyIndex = frequencyIndex_;
+    config.hmftHeader     = hmftHeader_;
     if (receiveMode) {
         const size_t autoChunkBytes = MinChunkBytesForFft(config);
         config.chunkBytes           = autoChunkBytes > static_cast<size_t>(std::numeric_limits<int>::max())
@@ -482,6 +486,25 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
         ImGui::TextColored(infoColor, "Multi-ch: using ch %d of %d", channelIndex_, channels_ - 1);
     }
 
+    // HMFT 헤더는 광대역 스캔(1채널) 모드 전용.
+    if (channels_ == 1) {
+        ImGui::Separator();
+        ImGui::TextColored(accent, "Frame Header");
+        ImGui::Checkbox("HMFT header (16B/2048)", &hmftHeader_);
+        if (hmftHeader_) {
+            if (snapshot.hmftValid) {
+                // 대역폭 코드 -> MHz (200M=0,100M=1,20M=2,10M=3,5M=4)
+                static const char *kBwName[] = {"200M", "100M", "20M", "10M", "5M"};
+                const char        *bw =
+                    (snapshot.hmftBwCode >= 0 && snapshot.hmftBwCode < 5) ? kBwName[snapshot.hmftBwCode] : "?";
+                ImGui::TextColored(infoColor, "seq %u  BW %s  Center %.3f MHz", snapshot.hmftSeq, bw,
+                                   static_cast<double>(snapshot.hmftCenterKHz) / 1000.0);
+            } else {
+                ImGui::TextColored(warnColor, "No HMFT magic parsed yet");
+            }
+        }
+    }  // channels_ == 1
+
     ImGui::Separator();
     ImGui::TextColored(accent, "Chart Style");
     if (ImGui::Button("Black", ImVec2(80, 24))) {
@@ -619,9 +642,11 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
     const float histH  = showSpectrogram_ ? std::max(120.0f, availH * 0.28f) : 0.0f;
     const float specH  = availH - histH - (showSpectrogram_ ? ImGui::GetStyle().ItemSpacing.y : 0.0f);
 
+    // HMFT(광대역 1채널) 모드: x축은 실제 주파수(MHz), y축은 dB가 아닌 원신호 값.
+    const bool   broadband = snapshot.hmftValid;
     const ImVec2 plotSize(-1, specH);
     if (ImPlot::BeginPlot("##spectrum", plotSize)) {
-        ImPlot::SetupAxes("Frequency (Hz)", "Magnitude (dB)");
+        ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)", broadband ? "Level" : "Magnitude (dB)");
         if (!snapshot.frequencies.empty() && snapshot.frequencies.size() == snapshot.magnitudesDb.size()) {
             const double xMin = static_cast<double>(snapshot.frequencies.front());
             const double xMax = static_cast<double>(snapshot.frequencies.back());
