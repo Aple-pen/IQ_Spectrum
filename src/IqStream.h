@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -107,6 +108,10 @@ protected:
   // 수신한 바이트를 파싱하여 스펙트럼/constellation 스냅샷을 갱신.
   void AppendSamples(const std::vector<uint8_t> &bytes,
                      const StreamConfig &config);
+  // 누적된 CenterFreq별 슬라이스를 주파수 순으로 이어붙여 광대역 스펙트럼
+  // 스냅샷(frequencies/magnitudesDb)을 재구성한다. 호출부가 mutex_를 잡은 상태로
+  // 호출해야 한다.
+  void RebuildWidebandSpectrum();
   void SetStatus(const std::string &status, const std::string &error = {});
 
   virtual void Run(StreamConfig config) = 0;
@@ -120,6 +125,18 @@ protected:
   std::vector<float> iSampleBuffer_;    // I channel accumulator (IQ mode)
   std::vector<float> qSampleBuffer_;    // Q channel accumulator (IQ mode)
   std::vector<uint8_t> remainderBytes_; // chunk 경계 미완성 바이트 carry-over
+
+  // 광대역 스캔(HMFT) 정책: CenterFreq(kHz)별로 payload 슬라이스를 하나씩만
+  // 유지한다. 동일 CenterFreq가 연속으로 반복되면 첫 프레임만 남기고 버린다.
+  // std::map은 key(centerKHz) 오름차순 정렬을 보장하므로, 순회하면 곧바로 낮은
+  // 주파수 -> 높은 주파수 순서로 이어붙일 수 있다.
+  struct WidebandSlice {
+    int bwCode = 0;             // 대역폭 코드 (0=200M,1=100M,2=20M,3=10M,4=5M)
+    std::vector<float> samples; // payload(2048B)를 int8 - DC offset 한 값
+  };
+  std::map<uint32_t, WidebandSlice> widebandSlices_; // key: centerKHz
+  uint32_t wbPrevCenterKHz_ = 0;   // 직전 프레임 center (연속 dedup 판정용)
+  bool wbHasPrevCenter_ = false;   // wbPrevCenterKHz_ 유효 여부
 
   // 캡처: STX/ETX 프레임(payload) 1개를 파일 1개로 분리 저장.
   // 캡처 시작 시 디렉터리를 만들고, WriteCapture 호출마다 인덱스 파일을 생성한다.

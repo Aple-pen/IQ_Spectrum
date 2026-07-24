@@ -29,6 +29,12 @@ enum class FrequencyValues {
 };
 }
 namespace {
+// 스펙트로그램 히트맵의 최대 표시 열 수. PlotHeatmap은 셀당 사각형을 하나씩
+// 그리므로, 광대역에서 bins(=슬라이스수*2048)가 커져도 이 값으로 열을
+// 다운샘플(max-pooling)해 렌더 비용을 상한으로 묶는다. 화면 폭보다 크게 그려도
+// 어차피 보이지 않으므로 시각적 손실은 거의 없다.
+constexpr int kMaxSpectrogramCols = 1024;
+
 int PushImGuiTheme(bool dark) {
   if (dark) {
     // Dark: Charcoal Blue + Amber accent
@@ -758,11 +764,6 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
   }
 
   const float availH = ImGui::GetContentRegionAvail().y;
-  const float histH =
-      showSpectrogram_ ? std::max(120.0f, availH * 0.28f) : 0.0f;
-  const float specH =
-      availH - histH -
-      (showSpectrogram_ ? ImGui::GetStyle().ItemSpacing.y : 0.0f);
 
   // HMFT(광대역 1채널) 모드: x축은 실제 주파수(MHz), y축은 dB가 아닌 원신호 값.
   const bool broadband = snapshot.hmftValid;
@@ -801,45 +802,34 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
 
   const int tierCount =
       (spectrumTiers_ && haveData) ? std::max(1, spectrumTierCount_) : 1;
-  if (tierCount > 1) {
-    // 긴 광대역 스펙트럼을 위->아래로 여러 단으로 나눠 각 단이 주파수 구간의
-    // 1/tierCount 만 담당하게 한다. 단 사이가 끊기지 않도록 경계 샘플을 겹친다.
-    const float gap = ImGui::GetStyle().ItemSpacing.y;
-    const float tierH =
-        std::max(60.0f, (specH - gap * (tierCount - 1)) / tierCount);
-    for (int t = 0; t < tierCount; ++t) {
-      const int begin = static_cast<int>(static_cast<int64_t>(specN) * t /
-                                         tierCount);
-      const int end = static_cast<int>(static_cast<int64_t>(specN) * (t + 1) /
-                                       tierCount);
-      // 다음 단 첫 샘플까지 포함해 라인이 이어지도록 한다.
-      const int last = std::min(end, specN - 1);
-      const int count = std::max(0, last - begin + 1);
-      char plotId[32];
-      std::snprintf(plotId, sizeof(plotId), "##spectrum_tier%d", t);
-      RenderSpectrumPlot(snapshot, plotId, begin, count, yMin, yMax, broadband,
-                         tierH);
-    }
-  } else {
-    RenderSpectrumPlot(snapshot, "##spectrum", 0, haveData ? specN : 0, yMin,
-                       yMax, broadband, specH);
-  }
-  ImPlot::PopStyleColor(5);
+  const bool drawSgram = showSpectrogram_ && haveData;
 
-  // Spectrogram: accumulate ring buffer
-  if (showSpectrogram_ && !snapshot.magnitudesDb.empty()) {
-    const int bins = static_cast<int>(snapshot.magnitudesDb.size());
+  // --- 스펙트로그램 링버퍼 누적 (레이아웃과 무관하게 전체 폭 기준으로 갱신) ---
+  // 링버퍼는 "전체 스펙트럼"을 한 행(row)으로 저장한다. 표시용 행렬은 열을
+  // 화면 해상도 수준(kMaxSpectrogramCols)으로 max-pooling 다운샘플해 둔다.
+  // 광대역에서 bins = 슬라이스수*2048로 폭발하는데, PlotHeatmap은 셀당 사각형을
+  // 하나씩 그리므로 다운샘플 없이는 매 프레임 수백만 셀을 그려 극도로 느려진다.
+  // 표시 행렬은 새 프레임이 들어왔을 때만(dirty) 재구성한다.
+  float scaleMin = yAxisAuto_ ? -140.0f : yAxisMin_;
+  float scaleMax = yAxisAuto_ ? 10.0f : yAxisMax_;
+  if (drawSgram) {
+    const int bins = specN;
+    const int dsCols = std::min(bins, kMaxSpectrogramCols);
 
     // Reset buffer on bin count change or rows change
     if (bins != spectrogramBins_ ||
         static_cast<int>(spectrogramBuf_.size()) != spectrogramRows_ * bins) {
       spectrogramBins_ = bins;
+      spectrogramDsCols_ = dsCols;
       spectrogramBuf_.assign(static_cast<size_t>(spectrogramRows_ * bins),
                              -180.0f);
-      spectrogramDisp_.clear();
+      spectrogramDisp_.assign(
+          static_cast<size_t>(spectrogramRows_) * static_cast<size_t>(dsCols),
+          -180.0f);
       spectrogramHead_ = 0;
       spectrogramFill_ = 0;
       lastFftFrameCount_ = 0;
+      spectrogramDirty_ = true;
     }
 
     // Detect streamer restart: fftFrameCount resets to 0
@@ -859,92 +849,117 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
       } else {
         ++spectrogramFill_;
       }
+      spectrogramDirty_ = true;
     }
 
-    if (spectrogramFill_ > 0) {
-      // Build linear display buffer: oldest row at top (index 0)
-      // Reuse pre-allocated buffer to avoid per-frame heap allocation
-      const size_t dispSize = static_cast<size_t>(spectrogramRows_ * bins);
-      if (spectrogramDisp_.size() != dispSize) {
-        spectrogramDisp_.assign(dispSize, -180.0f);
-      }
+    // 표시 행렬 재구성: 새 프레임/리셋이 있었을 때만. 가장 오래된 행이 위쪽
+    // (index 0). 열은 원본 [c0, c1) 그룹의 최댓값으로 다운샘플(피크 보존).
+    if (spectrogramDirty_ && spectrogramFill_ > 0) {
       std::fill(spectrogramDisp_.begin(), spectrogramDisp_.end(), -180.0f);
       for (int r = 0; r < spectrogramFill_; ++r) {
         const int srcRow = (spectrogramHead_ + r) % spectrogramRows_;
-        std::copy_n(spectrogramBuf_.begin() + srcRow * bins, bins,
-                    spectrogramDisp_.begin() + r * bins);
-      }
-
-      // dB scale bounds
-      float scaleMin = yAxisAuto_ ? -140.0f : yAxisMin_;
-      float scaleMax = yAxisAuto_ ? 10.0f : yAxisMax_;
-      if (yAxisAuto_) {
-        for (float v : snapshot.magnitudesDb) {
-          if (std::isfinite(v)) {
-            scaleMin = std::min(scaleMin, v);
-            scaleMax = std::max(scaleMax, v);
+        const float *src =
+            spectrogramBuf_.data() + static_cast<size_t>(srcRow) * bins;
+        float *dst = spectrogramDisp_.data() +
+                     static_cast<size_t>(r) * static_cast<size_t>(dsCols);
+        if (dsCols == bins) {
+          std::copy_n(src, bins, dst);
+        } else {
+          for (int oc = 0; oc < dsCols; ++oc) {
+            const int c0 =
+                static_cast<int>(static_cast<int64_t>(bins) * oc / dsCols);
+            const int c1 = std::max(
+                c0 + 1,
+                static_cast<int>(static_cast<int64_t>(bins) * (oc + 1) / dsCols));
+            float m = src[c0];
+            for (int c = c0 + 1; c < c1; ++c) {
+              m = std::max(m, src[c]);
+            }
+            dst[oc] = m;
           }
         }
       }
+      spectrogramDirty_ = false;
+    }
 
-      if (chartDark_) {
-        ImPlot::PushStyleColor(ImPlotCol_PlotBg,
-                               ImVec4(0.031f, 0.035f, 0.055f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_FrameBg,
-                               ImVec4(0.059f, 0.078f, 0.125f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_AxisText,
-                               ImVec4(0.478f, 0.561f, 0.710f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_AxisGrid,
-                               ImVec4(0.102f, 0.145f, 0.251f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_AxisTick,
-                               ImVec4(0.165f, 0.227f, 0.345f, 1.0f));
-      } else {
-        ImPlot::PushStyleColor(ImPlotCol_PlotBg,
-                               ImVec4(0.961f, 0.973f, 1.000f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_FrameBg,
-                               ImVec4(0.910f, 0.937f, 0.973f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_AxisText,
-                               ImVec4(0.227f, 0.314f, 0.439f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_AxisGrid,
-                               ImVec4(0.753f, 0.816f, 0.878f, 1.0f));
-        ImPlot::PushStyleColor(ImPlotCol_AxisTick,
-                               ImVec4(0.478f, 0.604f, 0.733f, 1.0f));
+    // dB scale bounds (전체 스펙트럼 기준, 모든 단이 공유)
+    if (yAxisAuto_) {
+      for (float v : snapshot.magnitudesDb) {
+        if (std::isfinite(v)) {
+          scaleMin = std::min(scaleMin, v);
+          scaleMax = std::max(scaleMax, v);
+        }
       }
-
-      const ImPlotColormap cmap =
-          chartDark_ ? ImPlotColormap_Plasma : ImPlotColormap_Viridis;
-      ImPlot::PushColormap(cmap);
-
-      const double xMin2 =
-          snapshot.frequencies.empty()
-              ? 0.0
-              : static_cast<double>(snapshot.frequencies.front());
-      const double xMax2 =
-          snapshot.frequencies.empty()
-              ? 1.0
-              : static_cast<double>(snapshot.frequencies.back());
-
-      const ImVec2 spectroSize(-1, histH);
-      if (ImPlot::BeginPlot("##spectrogram", spectroSize)) {
-        ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
-                          "Time (frames)");
-        ImPlot::SetupAxisLimits(ImAxis_X1, xMin2, xMax2, ImGuiCond_Always);
-        ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0,
-                                static_cast<double>(spectrogramRows_),
-                                ImGuiCond_Always);
-        // rows=spectrogramRows_, cols=bins
-        // bounds: (xMin2,yMin)=(freq_start,0) → (xMax2, spectrogramRows_)
-        ImPlot::PlotHeatmap(
-            "##heatmap", spectrogramDisp_.data(), spectrogramRows_, bins,
-            static_cast<double>(scaleMin), static_cast<double>(scaleMax),
-            nullptr, ImPlotPoint(xMin2, 0.0),
-            ImPlotPoint(xMax2, static_cast<double>(spectrogramRows_)));
-        ImPlot::EndPlot();
-      }
-      ImPlot::PopColormap();
-      ImPlot::PopStyleColor(5);
     }
   }
+
+  // --- 높이 배분: 단(段)마다 [스펙트럼 + 바로 아래 그 구간 스펙트로그램] ---
+  const bool sgramReady = drawSgram && spectrogramFill_ > 0;
+  const float gap = ImGui::GetStyle().ItemSpacing.y;
+  float specTierH;
+  float sgramTierH = 0.0f;
+  if (sgramReady) {
+    // 단마다 2개 플롯(스펙트럼+스펙트로그램) -> 총 2*tierCount 개.
+    const int plotRows = 2 * tierCount;
+    const float totalPlotH = std::max(1.0f, availH - gap * (plotRows - 1));
+    const float blockH = totalPlotH / static_cast<float>(tierCount);
+    sgramTierH = std::max(1.0f, blockH * 0.4f);
+    specTierH = std::max(1.0f, blockH * 0.6f);
+  } else {
+    const float totalPlotH =
+        std::max(1.0f, availH - gap * static_cast<float>(tierCount - 1));
+    specTierH = std::max(1.0f, totalPlotH / static_cast<float>(tierCount));
+  }
+
+  // --- 단별 렌더: 스펙트럼을 그리고, 바로 아래 같은 주파수 구간 스펙트로그램 ---
+  const ImPlotColormap cmap =
+      chartDark_ ? ImPlotColormap_Plasma : ImPlotColormap_Viridis;
+  // 스택된 플롯들의 축 여백(왼쪽 Y라벨 폭 등)을 정렬해, 스펙트럼과 스펙트로그램의
+  // x축 시작/끝 위치가 세로로 정확히 맞도록 한다. Y라벨 폭이 달라도(-160 vs 50)
+  // 플롯 영역이 어긋나지 않는다.
+  const bool aligned = ImPlot::BeginAlignedPlots("##spectiers");
+  for (int t = 0; t < tierCount; ++t) {
+    int begin = 0;
+    int count = haveData ? specN : 0;
+    if (tierCount > 1) {
+      // 주파수 구간을 tierCount 등분. 단 사이가 끊기지 않도록 경계 샘플을 겹친다.
+      begin = static_cast<int>(static_cast<int64_t>(specN) * t / tierCount);
+      const int end =
+          static_cast<int>(static_cast<int64_t>(specN) * (t + 1) / tierCount);
+      const int last = std::min(end, specN - 1);
+      count = std::max(0, last - begin + 1);
+    }
+    char specId[40];
+    std::snprintf(specId, sizeof(specId), "##spectrum_tier%d", t);
+    RenderSpectrumPlot(snapshot, specId, begin, count, yMin, yMax, broadband,
+                       specTierH);
+    if (sgramReady && count > 0) {
+      // 이 단의 주파수 구간은 스펙트럼 단과 동일하게 freq[begin..begin+count-1].
+      // 다운샘플된 표시 행렬에서 대응 열 구간을 비례로 잘라 같은 x축에 그린다.
+      const int dsCols = spectrogramDsCols_;
+      const int dsBegin =
+          static_cast<int>(static_cast<int64_t>(dsCols) * t / tierCount);
+      const int dsEnd =
+          (tierCount > 1)
+              ? static_cast<int>(static_cast<int64_t>(dsCols) * (t + 1) /
+                                 tierCount)
+              : dsCols;
+      const int dsCount = std::max(1, dsEnd - dsBegin);
+      const double xMin = static_cast<double>(snapshot.frequencies[begin]);
+      const double xMax =
+          static_cast<double>(snapshot.frequencies[begin + count - 1]);
+      char sgId[40];
+      std::snprintf(sgId, sizeof(sgId), "##spectrogram_tier%d", t);
+      ImPlot::PushColormap(cmap);
+      RenderSpectrogramPlot(sgId, dsBegin, dsCount, xMin, xMax, sgramTierH,
+                            scaleMin, scaleMax, broadband);
+      ImPlot::PopColormap();
+    }
+  }
+  if (aligned) {
+    ImPlot::EndAlignedPlots();
+  }
+  ImPlot::PopStyleColor(5);
 
   ImGui::EndChild();
 }
@@ -975,6 +990,54 @@ void App::RenderSpectrumPlot(const StreamSnapshot &snapshot, const char *plotId,
     ImPlot::SetupAxisLimits(ImAxis_Y1, -180.0, 10.0, ImGuiCond_Always);
   }
   ImPlot::EndPlot();
+}
+
+void App::RenderSpectrogramPlot(const char *plotId, int dsColBegin,
+                                int dsColCount, double xMin, double xMax,
+                                float height, float scaleMin, float scaleMax,
+                                bool broadband) {
+  const int dsCols = spectrogramDsCols_;
+  if (dsCols <= 0 || dsColCount <= 0 || dsColBegin < 0 ||
+      dsColBegin + dsColCount > dsCols ||
+      static_cast<int>(spectrogramDisp_.size()) < spectrogramRows_ * dsCols) {
+    return;
+  }
+
+  // 다운샘플된 표시 행렬(row-major [row*dsCols + col])에서
+  // [dsColBegin, dsColBegin+dsColCount) 열만 잘라 연속 버퍼로 모은다.
+  // PlotHeatmap이 stride 없는 연속 배열을 요구하기 때문. 단마다 열 수가 ±1
+  // 달라질 수 있어 버퍼는 최대 크기로만 키운다.
+  const size_t tileSize =
+      static_cast<size_t>(spectrogramRows_) * static_cast<size_t>(dsColCount);
+  if (spectrogramTile_.size() < tileSize) {
+    spectrogramTile_.resize(tileSize);
+  }
+  for (int r = 0; r < spectrogramRows_; ++r) {
+    const float *src = spectrogramDisp_.data() +
+                       static_cast<size_t>(r) * static_cast<size_t>(dsCols) +
+                       dsColBegin;
+    std::copy_n(src, dsColCount,
+                spectrogramTile_.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        static_cast<size_t>(r) *
+                        static_cast<size_t>(dsColCount)));
+  }
+
+  const ImVec2 spectroSize(-1, height);
+  if (ImPlot::BeginPlot(plotId, spectroSize)) {
+    ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
+                      "Time (frames)");
+    ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
+    ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0,
+                            static_cast<double>(spectrogramRows_),
+                            ImGuiCond_Always);
+    ImPlot::PlotHeatmap("##heatmap", spectrogramTile_.data(), spectrogramRows_,
+                        dsColCount, static_cast<double>(scaleMin),
+                        static_cast<double>(scaleMax), nullptr,
+                        ImPlotPoint(xMin, 0.0),
+                        ImPlotPoint(xMax, static_cast<double>(spectrogramRows_)));
+    ImPlot::EndPlot();
+  }
 }
 
 void App::RenderConstellation(const StreamSnapshot &snapshot) {

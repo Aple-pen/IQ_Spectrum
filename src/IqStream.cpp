@@ -13,14 +13,20 @@ namespace {
 // channels == 1(원신호) 모드에서 int8 값에 적용하는 고정 DC offset.
 constexpr int kMonoDcOffset = 70;
 
-// HMFT 프레임 헤더: 2048 payload마다 앞에 16바이트가 삽입된다 (모두 big-endian).
+// HMFT 프레임 헤더: 2048 payload마다 앞에 16바이트가 삽입된다 (모두
+// big-endian).
 //   [0]  4B Magic = "HMFT"(0x484D4654)
 //   [4]  4B Sequence Counter
 //   [8]  4B high user space: bit[31:29]=대역폭 코드, bit[28:0]=Center(kHz)
 //   [12] 4B low user space (reserved)
-constexpr uint32_t kHmftMagic = 0x484D4654u; // "HMFT"
-constexpr size_t kHmftHeaderBytes = 16;
-constexpr size_t kHmftPayloadBytes = 2048;
+constexpr uint32_t WB_MAGIC_NUMBER = 0x484D4654u; // "HMFT"
+constexpr size_t WB_HEADER_BYTES = 16;
+constexpr size_t WB_PAYLOAD_BYTES = 2048;
+// payload 2048 샘플 중 실제 유효 대역폭에 해당하는 중앙 샘플 수. 바깥쪽은 필터
+// 롤오프/가드 구간이라 버린다. 이 1666 샘플이 [center - bw/2, center + bw/2]에
+// 대응하므로, 인접 center끼리 경계에서 매끄럽게 이어진다.
+constexpr size_t WB_VALID_SAMPLES = 1666;
+constexpr size_t WB_VALID_OFFSET = (WB_PAYLOAD_BYTES - WB_VALID_SAMPLES) / 2; // 191
 
 uint32_t ReadBE32(const uint8_t *bytes) {
   return (static_cast<uint32_t>(bytes[0]) << 24U) |
@@ -60,6 +66,9 @@ void IqStream::StartWorker(const StreamConfig &config) {
     iSampleBuffer_.clear();
     qSampleBuffer_.clear();
     remainderBytes_.clear();
+    widebandSlices_.clear();
+    wbPrevCenterKHz_ = 0;
+    wbHasPrevCenter_ = false;
   }
 
   stopRequested_ = false;
@@ -106,25 +115,31 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
   std::vector<uint8_t> buf;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    buf.insert(buf.end(), remainderBytes_.begin(), remainderBytes_.end());
+    // buf.insert(buf.end(), remainderBytes_.begin(), remainderBytes_.end());
+    buf.swap(remainderBytes_);
   }
   buf.insert(buf.end(), bytes.begin(), bytes.end());
 
   // HMFT 프레임 헤더 처리: payload 스트림에서 magic("HMFT")을 스캔해 16바이트
-  // 헤더를 벗겨내고 payload(2048B)만 남긴다. chunk 경계로 프레임이 잘려도
-  // remainder로 이월한다. (config.hmftHeader가 꺼져 있으면 buf를 그대로 사용)
+  // 헤더를 벗겨내고 프레임마다 CenterFreq/BW를 읽는다. chunk 경계로 프레임이
+  // 잘려도 remainder로 이월한다.
   // HMFT 헤더는 광대역 스캔(1채널) 모드 전용이므로 channels == 1일 때만 적용.
+  //
+  // 광대역 스펙트럼 정책:
+  //   1. 전체 IQ 데이터를 읽어 CenterFreq 단위로 이어붙인다.
+  //   2. 동일 CenterFreq가 연속된 시퀀스로 들어오면 첫 프레임만 남기고 버린다.
+  //   3. CenterFreq별 payload 하나씩을 주파수 순으로 이어붙여 표시한다.
+  //   4. startFreq = (가장 작은 center - bw/2), endFreq = (가장 큰 center + bw/2).
   const bool hmftMode = config.hmftHeader && channels == 1;
-  std::vector<uint8_t> hmftCarry;
-  bool hmftAny = false;
-  uint32_t hmftSeq = 0;
-  uint32_t hmftHigh = 0;
   if (hmftMode) {
     auto matchMagic = [&](size_t i) -> bool {
-      return i + 4 <= buf.size() && ReadBE32(buf.data() + i) == kHmftMagic;
+      return i + 4 <= buf.size() && ReadBE32(buf.data() + i) == WB_MAGIC_NUMBER;
     };
-    std::vector<uint8_t> payload;
-    payload.reserve(buf.size());
+    std::vector<uint8_t> hmftCarry;
+    bool hmftAny = false;
+    bool wbChanged = false; // 이번 청크에서 슬라이스가 추가/갱신되었는지
+    uint32_t hmftSeq = 0;
+    uint32_t hmftHigh = 0;
     size_t pos = 0;
     while (true) {
       // pos부터 magic 위치 탐색 (초기 정렬 및 바이트 유실 시 재동기화)
@@ -139,25 +154,57 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
                          buf.end());
         break;
       }
-      if (m + kHmftHeaderBytes + kHmftPayloadBytes > buf.size()) {
+      if (m + WB_HEADER_BYTES + WB_PAYLOAD_BYTES > buf.size()) {
         // 프레임(헤더+payload)이 아직 덜 도착: magic부터 통째로 이월
         hmftCarry.assign(buf.begin() + static_cast<std::ptrdiff_t>(m),
                          buf.end());
         break;
       }
-      // 헤더 파싱 후 payload(2048B) 추출
+      // 헤더 파싱 후 CenterFreq/BW 추출
       hmftSeq = ReadBE32(buf.data() + m + 4);
       hmftHigh = ReadBE32(buf.data() + m + 8);
       hmftAny = true;
-      const size_t payloadStart = m + kHmftHeaderBytes;
-      payload.insert(
-          payload.end(),
-          buf.begin() + static_cast<std::ptrdiff_t>(payloadStart),
-          buf.begin() +
-              static_cast<std::ptrdiff_t>(payloadStart + kHmftPayloadBytes));
-      pos = payloadStart + kHmftPayloadBytes;
+      const uint32_t centerKHz = hmftHigh & 0x1FFFFFFFU;
+      const int bwCode = static_cast<int>((hmftHigh >> 29U) & 0x7U);
+      const size_t payloadStart = m + WB_HEADER_BYTES;
+
+      // 정책 2: 직전 프레임과 CenterFreq가 다를 때(=새 구간 시작)만 슬라이스를
+      // 저장하고, 연속된 동일 CenterFreq는 버린다. 스캔이 한 바퀴 돌아 같은
+      // center로 되돌아오면 map 항목을 최신 payload로 갱신한다.
+      if (!wbHasPrevCenter_ || centerKHz != wbPrevCenterKHz_) {
+        WidebandSlice &slice = widebandSlices_[centerKHz];
+        slice.bwCode = bwCode;
+        // payload 2048 중 중앙 1666 샘플(=유효 대역폭)만 저장.
+        slice.samples.resize(WB_VALID_SAMPLES);
+        for (size_t b = 0; b < WB_VALID_SAMPLES; ++b) {
+          const int raw = static_cast<int>(
+              static_cast<int8_t>(buf[payloadStart + WB_VALID_OFFSET + b]));
+          slice.samples[b] = static_cast<float>(raw - kMonoDcOffset);
+        }
+        wbPrevCenterKHz_ = centerKHz;
+        wbHasPrevCenter_ = true;
+        wbChanged = true;
+      }
+      pos = payloadStart + WB_PAYLOAD_BYTES;
     }
-    buf = std::move(payload);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    // HMFT 모드: 헤더 단위로 잘린 미완성 프레임을 이월.
+    remainderBytes_ = std::move(hmftCarry);
+    // 최근 파싱한 헤더 정보를 스냅샷에 반영 (UI 표시용).
+    if (hmftAny) {
+      snapshot_.hmftValid = true;
+      snapshot_.hmftSeq = hmftSeq;
+      snapshot_.hmftBwCode = static_cast<int>((hmftHigh >> 29U) & 0x7U);
+      snapshot_.hmftCenterKHz = hmftHigh & 0x1FFFFFFFU;
+    }
+    // 정책 3·4: 슬라이스가 실제로 바뀐 경우에만 스펙트럼을 재구성하고
+    // 스펙트로그램 행을 전진시킨다(연속 중복 청크는 갱신하지 않음).
+    if (wbChanged) {
+      RebuildWidebandSpectrum();
+      snapshot_.fftFrameCount += 1; // 스펙트로그램 갱신 트리거
+    }
+    return;
   }
 
   // 완전한 프레임 수 계산
@@ -195,23 +242,9 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  // 나머지 바이트 저장 (carry-over)
-  if (hmftMode) {
-    // HMFT 모드: 헤더 단위로 잘린 미완성 프레임을 이월 (payload는 2048의 배수라
-    // 샘플 단위 잔여는 없음).
-    remainderBytes_ = std::move(hmftCarry);
-  } else {
-    remainderBytes_.assign(buf.begin() + static_cast<std::ptrdiff_t>(usedBytes),
-                           buf.end());
-  }
-
-  // 파싱한 HMFT 헤더 정보를 스냅샷에 반영 (UI 표시용)
-  if (hmftMode && hmftAny) {
-    snapshot_.hmftValid = true;
-    snapshot_.hmftSeq = hmftSeq;
-    snapshot_.hmftBwCode = static_cast<int>((hmftHigh >> 29U) & 0x7U);
-    snapshot_.hmftCenterKHz = hmftHigh & 0x1FFFFFFFU;
-  }
+  // 나머지 바이트 저장 (carry-over). (HMFT 모드는 위에서 early-return 처리됨)
+  remainderBytes_.assign(buf.begin() + static_cast<std::ptrdiff_t>(usedBytes),
+                         buf.end());
 
   if (parsed.empty()) {
     return;
@@ -264,30 +297,15 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
     if (static_cast<int>(sampleBuffer_.size()) >= config.fftSize) {
       const size_t N = static_cast<size_t>(config.fftSize);
       // 최신 N개 샘플을 그대로 y값으로 사용 (FFT/dB 변환 없음)
-      snapshot_.magnitudesDb.assign(
-          sampleBuffer_.end() - static_cast<std::ptrdiff_t>(N),
-          sampleBuffer_.end());
-      // x축: HMFT 헤더가 있으면 center±BW/2 실제 주파수(MHz)로, 없으면 0..1 정규화.
+      snapshot_.magnitudesDb.assign(sampleBuffer_.end() -
+                                        static_cast<std::ptrdiff_t>(N),
+                                    sampleBuffer_.end());
+      // x축: 0..1 정규화 (python의 linspace(0,1,N)와 동일). 광대역(HMFT) x축은
+      // 위쪽 early-return 경로의 RebuildWidebandSpectrum이 담당한다.
       snapshot_.frequencies.resize(N);
       const float denom = N > 1 ? static_cast<float>(N - 1) : 1.0f;
-      if (hmftMode && hmftAny) {
-        // 대역폭 코드 -> MHz (200M=0,100M=1,20M=2,10M=3,5M=4)
-        static const float kBwMHz[] = {200.0f, 100.0f, 20.0f, 10.0f, 5.0f};
-        const int bwCode = static_cast<int>((hmftHigh >> 29U) & 0x7U);
-        const float bwMHz =
-            (bwCode >= 0 && bwCode < 5) ? kBwMHz[bwCode] : 1.0f;
-        const float centerMHz =
-            static_cast<float>(hmftHigh & 0x1FFFFFFFU) / 1000.0f;
-        const float startMHz = centerMHz - bwMHz * 0.5f;
-        for (size_t k = 0; k < N; ++k) {
-          snapshot_.frequencies[k] =
-              startMHz + bwMHz * static_cast<float>(k) / denom;
-        }
-      } else {
-        // python의 linspace(0,1,N)와 동일
-        for (size_t k = 0; k < N; ++k) {
-          snapshot_.frequencies[k] = static_cast<float>(k) / denom;
-        }
+      for (size_t k = 0; k < N; ++k) {
+        snapshot_.frequencies[k] = static_cast<float>(k) / denom;
       }
       snapshot_.fftFrameCount += 1;
     }
@@ -304,6 +322,46 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
     };
     trimAppendSnap(snapshot_.iSamples, iBuf);
     trimAppendSnap(snapshot_.qSamples, qBuf);
+  }
+}
+
+void IqStream::RebuildWidebandSpectrum() {
+  // 대역폭 코드 -> MHz (200M=0,100M=1,20M=2,10M=3,5M=4)
+  static const float kBwMHz[] = {200.0f, 100.0f, 20.0f, 10.0f, 5.0f};
+
+  size_t total = 0;
+  for (const auto &kv : widebandSlices_) {
+    total += kv.second.samples.size();
+  }
+  snapshot_.magnitudesDb.clear();
+  snapshot_.frequencies.clear();
+  if (total == 0) {
+    return;
+  }
+  snapshot_.magnitudesDb.reserve(total);
+  snapshot_.frequencies.reserve(total);
+
+  // std::map은 centerKHz 오름차순. 낮은 center부터 payload를 이어붙이면
+  // 자동으로 startFreq(가장 작은 center - bw/2) -> endFreq(가장 큰 center +
+  // bw/2) 순서가 된다. 각 슬라이스는 자신의 [center - bw/2, center + bw/2]
+  // 구간에 균등 배치한다(center 간격이 bw면 경계에서 매끄럽게 이어진다).
+  for (const auto &kv : widebandSlices_) {
+    const uint32_t centerKHz = kv.first;
+    const WidebandSlice &slice = kv.second;
+    const int n = static_cast<int>(slice.samples.size());
+    if (n == 0) {
+      continue;
+    }
+    const float bwMHz =
+        (slice.bwCode >= 0 && slice.bwCode < 5) ? kBwMHz[slice.bwCode] : 1.0f;
+    const float centerMHz = static_cast<float>(centerKHz) / 1000.0f;
+    const float startMHz = centerMHz - bwMHz * 0.5f;
+    const float denom = n > 1 ? static_cast<float>(n - 1) : 1.0f;
+    for (int k = 0; k < n; ++k) {
+      snapshot_.frequencies.push_back(startMHz +
+                                      bwMHz * static_cast<float>(k) / denom);
+      snapshot_.magnitudesDb.push_back(slice.samples[static_cast<size_t>(k)]);
+    }
   }
 }
 

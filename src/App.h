@@ -27,6 +27,12 @@ private:
   void RenderSpectrumPlot(const StreamSnapshot &snapshot, const char *plotId,
                           int i0, int count, double yMin, double yMax,
                           bool broadband, float height);
+  // 스펙트로그램 히트맵 1개를 그린다. 전체 표시 버퍼(spectrogramDisp_)에서 열
+  // 구간 [colBegin, colBegin+colCount)만 잘라내 그리므로, 광대역 3단 분할 시 각
+  // 스펙트럼 단 바로 아래에 같은 주파수 구간의 스펙트로그램을 배치할 수 있다.
+  void RenderSpectrogramPlot(const char *plotId, int dsColBegin, int dsColCount,
+                             double xMin, double xMax, float height,
+                             float scaleMin, float scaleMax, bool broadband);
   void RenderConstellation(const StreamSnapshot &snapshot);
 
   int mode_ = static_cast<int>(Mode::Playback);
@@ -60,10 +66,14 @@ private:
   float freqOffsetHz_ = 0.0f; // IQ heterodyne offset (shifts spectrum center)
   std::vector<float> spectrogramBuf_; // ring buffer [row * bins + bin]
   std::vector<float>
-      spectrogramDisp_;     // linear display buffer (reused each frame)
+      spectrogramDisp_; // 다운샘플된 표시 행렬 [row * dsCols + col], 새 프레임에만 갱신
+  std::vector<float>
+      spectrogramTile_;     // 단(段)별 열 구간 추출용 버퍼 (재사용)
   int spectrogramHead_ = 0; // index of oldest row
   int spectrogramFill_ = 0; // number of valid rows written
   int spectrogramBins_ = 0; // current bin count (detect reset)
+  int spectrogramDsCols_ = 0;      // 다운샘플 후 표시 열 수 (<= 원본 bins)
+  bool spectrogramDirty_ = false;  // 표시 행렬 재구성 필요 여부(새 프레임/리셋)
   uint64_t lastFftFrameCount_ = 0;
   int lastMode_ =
       static_cast<int>(Mode::Playback); // 모드 전환 시 스펙트로그램 리셋용
