@@ -22,6 +22,11 @@ private:
   void BrowseFile();
   void RenderControls(const StreamSnapshot &snapshot);
   void RenderSpectrum(const StreamSnapshot &snapshot, float width);
+  // 스펙트럼 라인 1개를 그린다. [i0, i0+count) 구간만 그리며(광대역 3단 분할에
+  // 사용), y축 한계는 호출부에서 모든 단이 공유하도록 계산해 전달한다.
+  void RenderSpectrumPlot(const StreamSnapshot &snapshot, const char *plotId,
+                          int i0, int count, double yMin, double yMax,
+                          bool broadband, float height);
   void RenderConstellation(const StreamSnapshot &snapshot);
 
   int mode_ = static_cast<int>(Mode::Playback);
@@ -46,6 +51,8 @@ private:
   bool yAxisAuto_ = true;
   float yAxisMin_ = -160.0f;
   float yAxisMax_ = 10.0f;
+  bool spectrumTiers_ = false; // 광대역 스펙트럼을 여러 단으로 나눠 표시
+  int spectrumTierCount_ = 3;  // 분할할 단(段) 수
   bool showSpectrogram_ = false;
   int spectrogramRows_ = 200; // number of time rows to keep
   bool showConstellation_ = false;

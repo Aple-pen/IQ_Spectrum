@@ -233,6 +233,10 @@ void App::LoadSettings(const char *path) {
       yAxisMin_ = std::stof(val);
     } else if (key == "yAxisMax") {
       yAxisMax_ = std::stof(val);
+    } else if (key == "spectrumTiers") {
+      spectrumTiers_ = val == "1";
+    } else if (key == "spectrumTierCount") {
+      spectrumTierCount_ = std::stoi(val);
     } else if (key == "showHistogram") {
       showSpectrogram_ = val == "1";
     } else if (key == "histogramBins") {
@@ -273,6 +277,8 @@ void App::SaveSettings(const char *path) const {
   f << "yAxisAuto=" << (yAxisAuto_ ? 1 : 0) << '\n';
   f << "yAxisMin=" << yAxisMin_ << '\n';
   f << "yAxisMax=" << yAxisMax_ << '\n';
+  f << "spectrumTiers=" << (spectrumTiers_ ? 1 : 0) << '\n';
+  f << "spectrumTierCount=" << spectrumTierCount_ << '\n';
   f << "showHistogram=" << (showSpectrogram_ ? 1 : 0) << '\n';
   f << "histogramBins=" << spectrogramRows_ << '\n';
   f << "showSpectrogram=" << (showSpectrogram_ ? 1 : 0) << '\n';
@@ -483,6 +489,20 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   if (!yAxisAuto_) {
     ImGui::InputFloat("Y min (dB)", &yAxisMin_);
     ImGui::InputFloat("Y max (dB)", &yAxisMax_);
+  }
+
+  ImGui::Separator();
+  ImGui::TextColored(accent, "Wideband");
+  ImGui::Checkbox("Split spectrum into tiers", &spectrumTiers_);
+  if (spectrumTiers_) {
+    ImGui::InputInt("Tiers", &spectrumTierCount_);
+    if (spectrumTierCount_ < 1)
+      spectrumTierCount_ = 1;
+    if (spectrumTierCount_ > 8)
+      spectrumTierCount_ = 8;
+    if (!snapshot.hmftValid) {
+      ImGui::TextColored(warnColor, "Best with HMFT wideband stream");
+    }
   }
 
   ImGui::Separator();
@@ -746,53 +766,63 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
 
   // HMFT(광대역 1채널) 모드: x축은 실제 주파수(MHz), y축은 dB가 아닌 원신호 값.
   const bool broadband = snapshot.hmftValid;
-  const ImVec2 plotSize(-1, specH);
-  if (ImPlot::BeginPlot("##spectrum", plotSize)) {
-    ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
-                      broadband ? "Level" : "Magnitude (dB)");
-    if (!snapshot.frequencies.empty() &&
-        snapshot.frequencies.size() == snapshot.magnitudesDb.size()) {
-      const double xMin = static_cast<double>(snapshot.frequencies.front());
-      const double xMax = static_cast<double>(snapshot.frequencies.back());
-      double yMin = -160.0;
-      double yMax = 10.0;
-      if (yAxisAuto_) {
-        bool hasFinite = false;
-        for (float value : snapshot.magnitudesDb) {
-          if (std::isfinite(value)) {
-            if (!hasFinite) {
-              yMin = value;
-              yMax = value;
-              hasFinite = true;
-            } else {
-              yMin = std::min(yMin, static_cast<double>(value));
-              yMax = std::max(yMax, static_cast<double>(value));
-            }
+  const int specN = static_cast<int>(snapshot.magnitudesDb.size());
+  const bool haveData =
+      specN > 0 && snapshot.frequencies.size() == snapshot.magnitudesDb.size();
+
+  // y축 한계는 전체 스펙트럼 기준으로 한 번만 계산해 모든 단이 공유하도록 한다.
+  double yMin = -160.0;
+  double yMax = 10.0;
+  if (haveData) {
+    if (yAxisAuto_) {
+      bool hasFinite = false;
+      for (float value : snapshot.magnitudesDb) {
+        if (std::isfinite(value)) {
+          if (!hasFinite) {
+            yMin = value;
+            yMax = value;
+            hasFinite = true;
+          } else {
+            yMin = std::min(yMin, static_cast<double>(value));
+            yMax = std::max(yMax, static_cast<double>(value));
           }
         }
-        if (hasFinite) {
-          const double margin = std::max(6.0, (yMax - yMin) * 0.15);
-          yMin -= margin;
-          yMax += margin;
-        }
-      } else {
-        yMin = static_cast<double>(yAxisMin_);
-        yMax = static_cast<double>(yAxisMax_);
       }
-      ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
-      ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
-      ImPlot::PushStyleColor(ImPlotCol_Line,
-                             chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f)
-                                        : ImVec4(0.169f, 0.424f, 0.690f, 1.0f));
-      ImPlot::PlotLine("Magnitude", snapshot.frequencies.data(),
-                       snapshot.magnitudesDb.data(),
-                       static_cast<int>(snapshot.magnitudesDb.size()));
-      ImPlot::PopStyleColor();
+      if (hasFinite) {
+        const double margin = std::max(6.0, (yMax - yMin) * 0.15);
+        yMin -= margin;
+        yMax += margin;
+      }
     } else {
-      ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Always);
-      ImPlot::SetupAxisLimits(ImAxis_Y1, -180.0, 10.0, ImGuiCond_Always);
+      yMin = static_cast<double>(yAxisMin_);
+      yMax = static_cast<double>(yAxisMax_);
     }
-    ImPlot::EndPlot();
+  }
+
+  const int tierCount =
+      (spectrumTiers_ && haveData) ? std::max(1, spectrumTierCount_) : 1;
+  if (tierCount > 1) {
+    // 긴 광대역 스펙트럼을 위->아래로 여러 단으로 나눠 각 단이 주파수 구간의
+    // 1/tierCount 만 담당하게 한다. 단 사이가 끊기지 않도록 경계 샘플을 겹친다.
+    const float gap = ImGui::GetStyle().ItemSpacing.y;
+    const float tierH =
+        std::max(60.0f, (specH - gap * (tierCount - 1)) / tierCount);
+    for (int t = 0; t < tierCount; ++t) {
+      const int begin = static_cast<int>(static_cast<int64_t>(specN) * t /
+                                         tierCount);
+      const int end = static_cast<int>(static_cast<int64_t>(specN) * (t + 1) /
+                                       tierCount);
+      // 다음 단 첫 샘플까지 포함해 라인이 이어지도록 한다.
+      const int last = std::min(end, specN - 1);
+      const int count = std::max(0, last - begin + 1);
+      char plotId[32];
+      std::snprintf(plotId, sizeof(plotId), "##spectrum_tier%d", t);
+      RenderSpectrumPlot(snapshot, plotId, begin, count, yMin, yMax, broadband,
+                         tierH);
+    }
+  } else {
+    RenderSpectrumPlot(snapshot, "##spectrum", 0, haveData ? specN : 0, yMin,
+                       yMax, broadband, specH);
   }
   ImPlot::PopStyleColor(5);
 
@@ -917,6 +947,34 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
   }
 
   ImGui::EndChild();
+}
+
+void App::RenderSpectrumPlot(const StreamSnapshot &snapshot, const char *plotId,
+                            int i0, int count, double yMin, double yMax,
+                            bool broadband, float height) {
+  const ImVec2 plotSize(-1, height);
+  if (!ImPlot::BeginPlot(plotId, plotSize)) {
+    return;
+  }
+  ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
+                    broadband ? "Level" : "Magnitude (dB)");
+  if (count > 0) {
+    const double xMin = static_cast<double>(snapshot.frequencies[i0]);
+    const double xMax =
+        static_cast<double>(snapshot.frequencies[i0 + count - 1]);
+    ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
+    ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
+    ImPlot::PushStyleColor(ImPlotCol_Line,
+                           chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f)
+                                      : ImVec4(0.169f, 0.424f, 0.690f, 1.0f));
+    ImPlot::PlotLine("Magnitude", snapshot.frequencies.data() + i0,
+                     snapshot.magnitudesDb.data() + i0, count);
+    ImPlot::PopStyleColor();
+  } else {
+    ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Always);
+    ImPlot::SetupAxisLimits(ImAxis_Y1, -180.0, 10.0, ImGuiCond_Always);
+  }
+  ImPlot::EndPlot();
 }
 
 void App::RenderConstellation(const StreamSnapshot &snapshot) {
