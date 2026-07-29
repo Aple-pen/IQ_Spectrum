@@ -26,7 +26,8 @@ constexpr size_t WB_PAYLOAD_BYTES = 2048;
 // 롤오프/가드 구간이라 버린다. 이 1666 샘플이 [center - bw/2, center + bw/2]에
 // 대응하므로, 인접 center끼리 경계에서 매끄럽게 이어진다.
 constexpr size_t WB_VALID_SAMPLES = 1666;
-constexpr size_t WB_VALID_OFFSET = (WB_PAYLOAD_BYTES - WB_VALID_SAMPLES) / 2; // 191
+constexpr size_t WB_VALID_OFFSET =
+    (WB_PAYLOAD_BYTES - WB_VALID_SAMPLES) / 2; // 191
 
 uint32_t ReadBE32(const uint8_t *bytes) {
   return (static_cast<uint32_t>(bytes[0]) << 24U) |
@@ -129,7 +130,8 @@ void IqStream::AppendSamples(const std::vector<uint8_t> &bytes,
   //   1. 전체 IQ 데이터를 읽어 CenterFreq 단위로 이어붙인다.
   //   2. 동일 CenterFreq가 연속된 시퀀스로 들어오면 첫 프레임만 남기고 버린다.
   //   3. CenterFreq별 payload 하나씩을 주파수 순으로 이어붙여 표시한다.
-  //   4. startFreq = (가장 작은 center - bw/2), endFreq = (가장 큰 center + bw/2).
+  //   4. startFreq = (가장 작은 center - bw/2), endFreq = (가장 큰 center +
+  //   bw/2).
   const bool hmftMode = config.hmftHeader && channels == 1;
   if (hmftMode) {
     auto matchMagic = [&](size_t i) -> bool {

@@ -34,6 +34,9 @@ namespace {
 // 다운샘플(max-pooling)해 렌더 비용을 상한으로 묶는다. 화면 폭보다 크게 그려도
 // 어차피 보이지 않으므로 시각적 손실은 거의 없다.
 constexpr int kMaxSpectrogramCols = 1024;
+// 스펙트로그램 히트맵의 최대 표시 행 수. History rows 를 크게 잡아 오래 저장해도,
+// 화면에 그리는 행은 이 값으로 max-pool 다운샘플해 렌더 비용(셀=행×열)을 묶는다.
+constexpr int kMaxSpectrogramRows = 512;
 
 int PushImGuiTheme(bool dark) {
   if (dark) {
@@ -207,6 +210,13 @@ void App::LoadSettings(const char *path) {
                 serverIp_.size() - 1);
     } else if (key == "serverPort") {
       serverPort_ = std::stoi(val);
+    } else if (key == "wbPort") {
+      wbPort_ = std::stoi(val);
+    } else if (key == "wbTopic") {
+      strncpy_s(wbTopic_.data(), wbTopic_.size(), val.c_str(),
+                wbTopic_.size() - 1);
+    } else if (key == "wbLinesPerCycle") {
+      wbLinesPerCycle_ = std::stoi(val);
     } else if (key == "fftSize") {
       const int v = std::stoi(val);
       // Snap to nearest valid power-of-two >= 256
@@ -251,6 +261,8 @@ void App::LoadSettings(const char *path) {
       showSpectrogram_ = val == "1";
     } else if (key == "spectrogramRows") {
       spectrogramRows_ = std::stoi(val);
+    } else if (key == "spectrogramHeightPct") {
+      spectrogramHeightPct_ = std::stoi(val);
     } else if (key == "freqOffsetHz") {
       freqOffsetHz_ = std::stof(val);
     } else if (key == "frequencyIndex") {
@@ -270,6 +282,9 @@ void App::SaveSettings(const char *path) const {
   f << "port=" << port_ << '\n';
   f << "serverIp=" << serverIp_.data() << '\n';
   f << "serverPort=" << serverPort_ << '\n';
+  f << "wbPort=" << wbPort_ << '\n';
+  f << "wbTopic=" << wbTopic_.data() << '\n';
+  f << "wbLinesPerCycle=" << wbLinesPerCycle_ << '\n';
   f << "fftSize=" << fftSize_ << '\n';
   f << "chunkBytes=" << chunkBytes_ << '\n';
   f << "sendIntervalMs=" << sendIntervalMs_ << '\n';
@@ -289,14 +304,19 @@ void App::SaveSettings(const char *path) const {
   f << "histogramBins=" << spectrogramRows_ << '\n';
   f << "showSpectrogram=" << (showSpectrogram_ ? 1 : 0) << '\n';
   f << "spectrogramRows=" << spectrogramRows_ << '\n';
+  f << "spectrogramHeightPct=" << spectrogramHeightPct_ << '\n';
   f << "freqOffsetHz=" << freqOffsetHz_ << '\n';
   f << "frequencyIndex=" << frequencyIndex_ << '\n';
 }
 
 IqStream &App::Active() {
-  return mode_ == static_cast<int>(Mode::Receive)
-             ? static_cast<IqStream &>(receiver_)
-             : static_cast<IqStream &>(streamer_);
+  if (mode_ == static_cast<int>(Mode::Wideband)) {
+    return static_cast<IqStream &>(wbReceiver_);
+  }
+  if (mode_ == static_cast<int>(Mode::Receive)) {
+    return static_cast<IqStream &>(receiver_);
+  }
+  return static_cast<IqStream &>(streamer_);
 }
 
 void App::Render() {
@@ -340,7 +360,14 @@ StreamConfig App::BuildConfig() const {
   StreamConfig config;
   config.filePath = filePath_.data();
   const bool receiveMode = (mode_ == static_cast<int>(Mode::Receive));
-  if (mode_ == static_cast<int>(Mode::Receive)) {
+  const bool wideband = (mode_ == static_cast<int>(Mode::Wideband));
+  if (wideband) {
+    // 광대역 WB Viewer: 접속 IP는 serverIp_ 재사용, 포트/토픽은 전용.
+    config.ip = serverIp_.data();
+    config.port = static_cast<uint16_t>(std::clamp(wbPort_, 1, 65535));
+    config.wbTopic = wbTopic_.data();
+    config.wbLinesPerCycle = wbLinesPerCycle_;
+  } else if (receiveMode) {
     config.ip = serverIp_.data();
     config.port = static_cast<uint16_t>(std::clamp(serverPort_, 1, 65535));
   } else {
@@ -413,7 +440,8 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   // 캡처 중에는 Start/Stop · Capture 버튼을 제외한 모든 컨트롤을 잠금.
   ImGui::BeginDisabled(snapshot.captureActive);
 
-  // 모드 선택: 재생(서버) vs 실시간 수신(클라이언트). 실행 중에는 잠금.
+  // 모드 선택: 재생(서버) / 실시간 수신(클라이언트) / 광대역 WB Viewer.
+  // 실행 중에는 잠금.
   ImGui::TextColored(accent, "Mode");
   ImGui::BeginDisabled(snapshot.streamRunning);
   ImGui::RadioButton("Playback (Server)", &mode_,
@@ -421,12 +449,35 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   ImGui::SameLine();
   ImGui::RadioButton("Receive (Client)", &mode_,
                      static_cast<int>(Mode::Receive));
+  ImGui::RadioButton("Wideband (WB Viewer)", &mode_,
+                     static_cast<int>(Mode::Wideband));
   ImGui::EndDisabled();
 
   const bool receiveMode = (mode_ == static_cast<int>(Mode::Receive));
+  const bool wideband = (mode_ == static_cast<int>(Mode::Wideband));
 
   ImGui::Separator();
-  if (!receiveMode) {
+  if (wideband) {
+    // 광대역 WB Viewer(WBSG/ZeroMQ) 모드: 스캐너 IP/포트/토픽에 SUB 접속.
+    ImGui::TextColored(accent, "WB Viewer (ZeroMQ SUB)");
+    ImGui::InputText("Scanner IP", serverIp_.data(), serverIp_.size());
+    ImGui::InputInt("Port", &wbPort_);
+    if (wbPort_ < 1)
+      wbPort_ = 1;
+    if (wbPort_ > 65535)
+      wbPort_ = 65535;
+    ImGui::InputText("Topic", wbTopic_.data(), wbTopic_.size());
+    ImGui::TextColored(infoColor, "tcp://%s:%d  topic=\"%s\"", serverIp_.data(),
+                       wbPort_, wbTopic_.data());
+    ImGui::Checkbox("Auto-reconnect", &loop_);
+    // 사이클당 스펙트로그램 행 수. 0 = 사이클의 실제 dwell 행 수 그대로(압축 없음).
+    ImGui::InputInt("Lines/cycle (0=auto)", &wbLinesPerCycle_);
+    if (wbLinesPerCycle_ < 0)
+      wbLinesPerCycle_ = 0;
+    if (wbLinesPerCycle_ > 4096)
+      wbLinesPerCycle_ = 4096;
+    ImGui::TextColored(infoColor, "WBSG v2 cycle snapshot (self-describing)");
+  } else if (!receiveMode) {
     // 재생(서버) 모드: 파일 + bind IP/listen 포트
     ImGui::TextColored(accent, "Source");
     ImGui::SetNextItemWidth(-76);
@@ -506,11 +557,14 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
       spectrumTierCount_ = 1;
     if (spectrumTierCount_ > 8)
       spectrumTierCount_ = 8;
-    if (!snapshot.hmftValid) {
+    if (!wideband && !snapshot.hmftValid) {
       ImGui::TextColored(warnColor, "Best with HMFT wideband stream");
     }
   }
 
+  // 아래 FFT/샘플/채널/HMFT 섹션은 IQ·HMFT 경로 전용이라 WB Viewer 모드에서는 숨김
+  // (WBSG 는 자기기술 포맷이라 이 설정들이 필요 없다).
+  if (!wideband) {
   ImGui::Separator();
   ImGui::TextColored(accent, "FFT");
   {
@@ -612,6 +666,7 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
     }
   }
   } // channels_ == 1
+  } // !wideband (FFT/샘플/채널/HMFT 섹션)
 
   ImGui::Separator();
   ImGui::TextColored(accent, "Chart Style");
@@ -627,44 +682,51 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   ImGui::TextColored(accent, "Spectrogram");
   ImGui::Checkbox("Show spectrogram", &showSpectrogram_);
   if (showSpectrogram_) {
+    // 유지할 시간 행 수. WB 모드는 사이클당 여러 dwell 행(예: 480)이 들어오므로,
+    // 한 사이클을 온전히 보려면 이 값을 사이클 행 수(Lines/cycle) 이상으로 둔다.
     ImGui::InputInt("History rows", &spectrogramRows_);
     if (spectrogramRows_ < 10)
       spectrogramRows_ = 10;
-    if (spectrogramRows_ > 1000)
-      spectrogramRows_ = 1000;
+    if (spectrogramRows_ > 4096)
+      spectrogramRows_ = 4096;
+    // 각 단 블록에서 스펙트로그램이 차지하는 세로 비율. 나머지는 스펙트럼 몫.
+    ImGui::SliderInt("Spectrogram height %", &spectrogramHeightPct_, 20, 80);
   }
 
-  ImGui::Separator();
-  ImGui::TextColored(accent, "Constellation");
-  ImGui::Checkbox("Show constellation", &showConstellation_);
-  if (showConstellation_) {
-    ImGui::InputInt("Points", &constellationPoints_);
-    if (constellationPoints_ < 64)
-      constellationPoints_ = 64;
-    if (constellationPoints_ > 8192)
-      constellationPoints_ = 8192;
-    if (channels_ < 2) {
-      ImGui::TextColored(warnColor, "Needs Channels >= 2 (IQ)");
+  // Constellation·IQ Freq Offset 도 IQ 경로 전용이라 WB Viewer 모드에서는 숨김.
+  if (!wideband) {
+    ImGui::Separator();
+    ImGui::TextColored(accent, "Constellation");
+    ImGui::Checkbox("Show constellation", &showConstellation_);
+    if (showConstellation_) {
+      ImGui::InputInt("Points", &constellationPoints_);
+      if (constellationPoints_ < 64)
+        constellationPoints_ = 64;
+      if (constellationPoints_ > 8192)
+        constellationPoints_ = 8192;
+      if (channels_ < 2) {
+        ImGui::TextColored(warnColor, "Needs Channels >= 2 (IQ)");
+      }
     }
-  }
 
-  ImGui::Separator();
-  ImGui::TextColored(accent, "IQ Freq Offset");
-  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0f);
-  if (ImGui::DragFloat(
-          "##freqOffset", &freqOffsetHz_,
-          sampleRateHz_ > 0 ? sampleRateHz_ / static_cast<float>(fftSize_)
-                            : 1.0f,
-          -sampleRateHz_ * 0.5f, sampleRateHz_ * 0.5f, "%.1f Hz")) {
+    ImGui::Separator();
+    ImGui::TextColored(accent, "IQ Freq Offset");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0f);
+    if (ImGui::DragFloat(
+            "##freqOffset", &freqOffsetHz_,
+            sampleRateHz_ > 0 ? sampleRateHz_ / static_cast<float>(fftSize_)
+                              : 1.0f,
+            -sampleRateHz_ * 0.5f, sampleRateHz_ * 0.5f, "%.1f Hz")) {
+      Active().SetFreqOffset(freqOffsetHz_);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset##fo")) {
+      freqOffsetHz_ = 0.0f;
+      Active().SetFreqOffset(0.0f);
+    }
+    // keep active component in sync even if value unchanged (e.g. after load)
     Active().SetFreqOffset(freqOffsetHz_);
   }
-  ImGui::SameLine();
-  if (ImGui::Button("Reset##fo")) {
-    freqOffsetHz_ = 0.0f;
-    Active().SetFreqOffset(0.0f);
-  }
-  // keep active component in sync even if value unchanged (e.g. after load)
-  Active().SetFreqOffset(freqOffsetHz_);
 
   // 여기까지가 캡처 중 잠금 대상. 아래 Start/Stop·Capture 버튼은 활성 유지.
   ImGui::EndDisabled();
@@ -673,8 +735,14 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   if (!snapshot.streamRunning) {
     if (ImGui::Button("Start", ImVec2(110, 34))) {
       std::string error;
-      const bool ok = receiveMode ? receiver_.Start(BuildConfig(), error)
-                                  : streamer_.Start(BuildConfig(), error);
+      bool ok = false;
+      if (wideband) {
+        ok = wbReceiver_.Start(BuildConfig(), error);
+      } else if (receiveMode) {
+        ok = receiver_.Start(BuildConfig(), error);
+      } else {
+        ok = streamer_.Start(BuildConfig(), error);
+      }
       if (!ok) {
         lastError_ = error;
       }
@@ -711,13 +779,14 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
 
   ImGui::Separator();
   ImGui::Text("Status: %s", snapshot.status.c_str());
-  if (!receiveMode) {
+  if (!receiveMode && !wideband) {
     ImGui::Text("Listening: %s", snapshot.listening ? "yes" : "no");
   }
   ImGui::Text("Connected: %s", snapshot.connected ? "yes" : "no");
-  ImGui::Text("%s: %llu", receiveMode ? "Recv packets" : "Sent packets",
+  const bool recvLike = receiveMode || wideband;
+  ImGui::Text("%s: %llu", wideband ? "Cycles" : (recvLike ? "Recv packets" : "Sent packets"),
               static_cast<unsigned long long>(snapshot.packetsSent));
-  ImGui::Text("%s: %llu", receiveMode ? "Recv bytes" : "Sent bytes",
+  ImGui::Text("%s: %llu", recvLike ? "Recv bytes" : "Sent bytes",
               static_cast<unsigned long long>(snapshot.bytesSent));
 
   if (!snapshot.error.empty()) {
@@ -815,17 +884,18 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
   if (drawSgram) {
     const int bins = specN;
     const int dsCols = std::min(bins, kMaxSpectrogramCols);
+    const int dsRows = std::min(spectrogramRows_, kMaxSpectrogramRows);
 
     // Reset buffer on bin count change or rows change
     if (bins != spectrogramBins_ ||
         static_cast<int>(spectrogramBuf_.size()) != spectrogramRows_ * bins) {
       spectrogramBins_ = bins;
       spectrogramDsCols_ = dsCols;
+      spectrogramDsRows_ = dsRows;
       spectrogramBuf_.assign(static_cast<size_t>(spectrogramRows_ * bins),
                              -180.0f);
       spectrogramDisp_.assign(
-          static_cast<size_t>(spectrogramRows_) * static_cast<size_t>(dsCols),
-          -180.0f);
+          static_cast<size_t>(dsRows) * static_cast<size_t>(dsCols), -180.0f);
       spectrogramHead_ = 0;
       spectrogramFill_ = 0;
       lastFftFrameCount_ = 0;
@@ -837,46 +907,75 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
       lastFftFrameCount_ = 0;
     }
 
-    // Push one row per new FFT frame
+    // 새 프레임마다 스펙트로그램에 행을 추가한다. WB 모드는 한 사이클의 dwell
+    // 여러 행(spectrogramBlock)을 통째로 밀어넣어 시간구조를 보존하고, 그 외
+    // 모드는 magnitudesDb 를 1행으로 넣는다.
     if (snapshot.fftFrameCount > lastFftFrameCount_) {
       lastFftFrameCount_ = snapshot.fftFrameCount;
-      const int writeRow =
-          (spectrogramHead_ + spectrogramFill_) % spectrogramRows_;
-      std::copy(snapshot.magnitudesDb.begin(), snapshot.magnitudesDb.end(),
-                spectrogramBuf_.begin() + writeRow * bins);
-      if (spectrogramFill_ == spectrogramRows_) {
-        spectrogramHead_ = (spectrogramHead_ + 1) % spectrogramRows_;
-      } else {
-        ++spectrogramFill_;
+      const bool haveBlock =
+          snapshot.spectrogramBlock &&
+          snapshot.spectrogramBlockRows > 0 &&
+          static_cast<int>(snapshot.spectrogramBlock->size()) ==
+              snapshot.spectrogramBlockRows * bins;
+      const int pushRows = haveBlock ? snapshot.spectrogramBlockRows : 1;
+      for (int pr = 0; pr < pushRows; ++pr) {
+        const float *src = haveBlock
+                               ? snapshot.spectrogramBlock->data() + pr * bins
+                               : snapshot.magnitudesDb.data();
+        const int writeRow =
+            (spectrogramHead_ + spectrogramFill_) % spectrogramRows_;
+        std::copy_n(src, bins, spectrogramBuf_.begin() + writeRow * bins);
+        if (spectrogramFill_ == spectrogramRows_) {
+          spectrogramHead_ = (spectrogramHead_ + 1) % spectrogramRows_;
+        } else {
+          ++spectrogramFill_;
+        }
       }
       spectrogramDirty_ = true;
     }
 
-    // 표시 행렬 재구성: 새 프레임/리셋이 있었을 때만. 가장 오래된 행이 위쪽
-    // (index 0). 열은 원본 [c0, c1) 그룹의 최댓값으로 다운샘플(피크 보존).
+    // 표시 행렬 재구성: 새 프레임/리셋이 있었을 때만. 저장된 fill 행(가장 오래된
+    // 것이 위쪽 index 0)을 표시 행 수(dsRows)로, 열을 dsCols 로 각각 max-pool
+    // 다운샘플한다(행·열 모두 피크 보존). fill 이 dsRows 보다 적으면 그대로 두고
+    // 나머지는 패딩(-180).
     if (spectrogramDirty_ && spectrogramFill_ > 0) {
       std::fill(spectrogramDisp_.begin(), spectrogramDisp_.end(), -180.0f);
-      for (int r = 0; r < spectrogramFill_; ++r) {
-        const int srcRow = (spectrogramHead_ + r) % spectrogramRows_;
-        const float *src =
-            spectrogramBuf_.data() + static_cast<size_t>(srcRow) * bins;
+      const int srcRows = spectrogramFill_;
+      for (int r = 0; r < dsRows; ++r) {
+        // 이 표시 행이 덮는 원본(ring) 행 구간 [rLo, rHi).
+        int rLo;
+        int rHi;
+        if (srcRows <= dsRows) {
+          if (r >= srcRows) {
+            continue; // 남는 표시 행은 패딩 유지
+          }
+          rLo = r;
+          rHi = r + 1;
+        } else {
+          rLo = static_cast<int>(static_cast<int64_t>(r) * srcRows / dsRows);
+          rHi = static_cast<int>(static_cast<int64_t>(r + 1) * srcRows / dsRows);
+          if (rHi <= rLo) {
+            rHi = rLo + 1;
+          }
+        }
         float *dst = spectrogramDisp_.data() +
                      static_cast<size_t>(r) * static_cast<size_t>(dsCols);
-        if (dsCols == bins) {
-          std::copy_n(src, bins, dst);
-        } else {
-          for (int oc = 0; oc < dsCols; ++oc) {
-            const int c0 =
-                static_cast<int>(static_cast<int64_t>(bins) * oc / dsCols);
-            const int c1 = std::max(
-                c0 + 1,
-                static_cast<int>(static_cast<int64_t>(bins) * (oc + 1) / dsCols));
-            float m = src[c0];
-            for (int c = c0 + 1; c < c1; ++c) {
-              m = std::max(m, src[c]);
+        for (int oc = 0; oc < dsCols; ++oc) {
+          const int c0 =
+              static_cast<int>(static_cast<int64_t>(bins) * oc / dsCols);
+          const int c1 = std::max(
+              c0 + 1,
+              static_cast<int>(static_cast<int64_t>(bins) * (oc + 1) / dsCols));
+          float m = -std::numeric_limits<float>::max();
+          for (int sr = rLo; sr < rHi; ++sr) {
+            const int ring = (spectrogramHead_ + sr) % spectrogramRows_;
+            const float *srow =
+                spectrogramBuf_.data() + static_cast<size_t>(ring) * bins;
+            for (int c = c0; c < c1; ++c) {
+              m = std::max(m, srow[c]);
             }
-            dst[oc] = m;
           }
+          dst[oc] = m;
         }
       }
       spectrogramDirty_ = false;
@@ -903,8 +1002,11 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
     const int plotRows = 2 * tierCount;
     const float totalPlotH = std::max(1.0f, availH - gap * (plotRows - 1));
     const float blockH = totalPlotH / static_cast<float>(tierCount);
-    sgramTierH = std::max(1.0f, blockH * 0.4f);
-    specTierH = std::max(1.0f, blockH * 0.6f);
+    const float sgFrac =
+        std::clamp(static_cast<float>(spectrogramHeightPct_), 20.0f, 80.0f) /
+        100.0f;
+    sgramTierH = std::max(1.0f, blockH * sgFrac);
+    specTierH = std::max(1.0f, blockH * (1.0f - sgFrac));
   } else {
     const float totalPlotH =
         std::max(1.0f, availH - gap * static_cast<float>(tierCount - 1));
@@ -997,9 +1099,10 @@ void App::RenderSpectrogramPlot(const char *plotId, int dsColBegin,
                                 float height, float scaleMin, float scaleMax,
                                 bool broadband) {
   const int dsCols = spectrogramDsCols_;
-  if (dsCols <= 0 || dsColCount <= 0 || dsColBegin < 0 ||
+  const int dsRows = spectrogramDsRows_;
+  if (dsCols <= 0 || dsRows <= 0 || dsColCount <= 0 || dsColBegin < 0 ||
       dsColBegin + dsColCount > dsCols ||
-      static_cast<int>(spectrogramDisp_.size()) < spectrogramRows_ * dsCols) {
+      static_cast<int>(spectrogramDisp_.size()) < dsRows * dsCols) {
     return;
   }
 
@@ -1008,11 +1111,11 @@ void App::RenderSpectrogramPlot(const char *plotId, int dsColBegin,
   // PlotHeatmap이 stride 없는 연속 배열을 요구하기 때문. 단마다 열 수가 ±1
   // 달라질 수 있어 버퍼는 최대 크기로만 키운다.
   const size_t tileSize =
-      static_cast<size_t>(spectrogramRows_) * static_cast<size_t>(dsColCount);
+      static_cast<size_t>(dsRows) * static_cast<size_t>(dsColCount);
   if (spectrogramTile_.size() < tileSize) {
     spectrogramTile_.resize(tileSize);
   }
-  for (int r = 0; r < spectrogramRows_; ++r) {
+  for (int r = 0; r < dsRows; ++r) {
     const float *src = spectrogramDisp_.data() +
                        static_cast<size_t>(r) * static_cast<size_t>(dsCols) +
                        dsColBegin;
@@ -1028,14 +1131,13 @@ void App::RenderSpectrogramPlot(const char *plotId, int dsColBegin,
     ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
                       "Time (frames)");
     ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
-    ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0,
-                            static_cast<double>(spectrogramRows_),
+    ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, static_cast<double>(dsRows),
                             ImGuiCond_Always);
-    ImPlot::PlotHeatmap("##heatmap", spectrogramTile_.data(), spectrogramRows_,
-                        dsColCount, static_cast<double>(scaleMin),
+    ImPlot::PlotHeatmap("##heatmap", spectrogramTile_.data(), dsRows, dsColCount,
+                        static_cast<double>(scaleMin),
                         static_cast<double>(scaleMax), nullptr,
                         ImPlotPoint(xMin, 0.0),
-                        ImPlotPoint(xMax, static_cast<double>(spectrogramRows_)));
+                        ImPlotPoint(xMax, static_cast<double>(dsRows)));
     ImPlot::EndPlot();
   }
 }

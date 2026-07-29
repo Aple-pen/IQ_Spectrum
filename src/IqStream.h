@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,6 +33,11 @@ struct StreamConfig {
   // true면 payload 스트림에 2048 payload마다 16바이트 HMFT 헤더가 삽입되어
   // 있다고 보고, magic("HMFT")을 스캔해 헤더를 벗겨낸 뒤 payload만 파싱한다.
   bool hmftHeader = false;
+  // 광대역 WB Viewer(WBSG/ZeroMQ) 모드에서 구독할 토픽 문자열.
+  std::string wbTopic = "WB";
+  // WB 사이클 하나를 스펙트로그램 몇 행으로 표시할지. 0 = auto(사이클의 실제
+  // 최대 dwell 행 수 그대로). >0 이면 그 값으로 축소/확대.
+  int wbLinesPerCycle = 0;
 };
 
 inline size_t BytesPerScalarSample(SampleFormat sampleFormat) {
@@ -68,6 +74,13 @@ struct StreamSnapshot {
   std::vector<float> magnitudesDb;
   std::vector<float> iSamples; // recent I samples (constellation)
   std::vector<float> qSamples; // recent Q samples (constellation)
+
+  // 스펙트로그램에 이번 프레임에 추가할 행 묶음 (row-major [row*bins + bin],
+  // bins == magnitudesDb.size()). WB 모드는 한 사이클의 dwell 여러 행을 여기에
+  // 실어 보낸다. 널이면 소비단은 magnitudesDb 를 1행으로 사용(기존 동작).
+  // 매 프레임 스냅샷 복사 비용을 없애기 위해 shared_ptr 로 공유한다.
+  std::shared_ptr<const std::vector<float>> spectrogramBlock;
+  int spectrogramBlockRows = 0;
 
   // 최근 파싱한 HMFT 헤더 정보 (config.hmftHeader가 켜진 경우에만 갱신).
   bool hmftValid = false;      // 유효한 헤더를 1개 이상 파싱했는지

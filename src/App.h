@@ -2,6 +2,7 @@
 
 #include "BinStreamer.h"
 #include "IqReceiver.h"
+#include "WbViewerReceiver.h"
 
 #include <array>
 #include <cstdint>
@@ -15,7 +16,7 @@ public:
   void SaveSettings(const char *path = "settings.ini") const;
 
 private:
-  enum class Mode { Playback = 0, Receive = 1 };
+  enum class Mode { Playback = 0, Receive = 1, Wideband = 2 };
 
   StreamConfig BuildConfig() const;
   IqStream &Active();
@@ -42,6 +43,10 @@ private:
   std::array<char, 64> serverIp_{'1', '2', '7', '.', '0',
                                  '.', '0', '.', '1', '\0'};
   int serverPort_ = 9000;
+  // 광대역 WB Viewer(ZeroMQ/WBSG) 접속 정보. 접속 IP는 serverIp_ 재사용.
+  int wbPort_ = 5557;
+  std::array<char, 32> wbTopic_{'W', 'B', '\0'};
+  int wbLinesPerCycle_ = 0; // WB: 사이클당 스펙트로그램 행 수 (0=auto=실제 dwell)
   int fftSize_ = 1024;
   int chunkBytes_ = 4096;
   int sendIntervalMs_ = 10;
@@ -60,7 +65,8 @@ private:
   bool spectrumTiers_ = false; // 광대역 스펙트럼을 여러 단으로 나눠 표시
   int spectrumTierCount_ = 3;  // 분할할 단(段) 수
   bool showSpectrogram_ = false;
-  int spectrogramRows_ = 200; // number of time rows to keep
+  int spectrogramRows_ = 200;      // number of time rows to keep
+  int spectrogramHeightPct_ = 60;  // 단 블록에서 스펙트로그램이 차지할 높이 비율(%)
   bool showConstellation_ = false;
   int constellationPoints_ = 1024; // number of IQ points to display
   float freqOffsetHz_ = 0.0f; // IQ heterodyne offset (shifts spectrum center)
@@ -73,11 +79,13 @@ private:
   int spectrogramFill_ = 0; // number of valid rows written
   int spectrogramBins_ = 0; // current bin count (detect reset)
   int spectrogramDsCols_ = 0;      // 다운샘플 후 표시 열 수 (<= 원본 bins)
+  int spectrogramDsRows_ = 0;      // 다운샘플 후 표시 행 수 (<= History rows)
   bool spectrogramDirty_ = false;  // 표시 행렬 재구성 필요 여부(새 프레임/리셋)
   uint64_t lastFftFrameCount_ = 0;
   int lastMode_ =
       static_cast<int>(Mode::Playback); // 모드 전환 시 스펙트로그램 리셋용
   std::string lastError_;
-  BinStreamer streamer_; // 재생(서버) 모드
-  IqReceiver receiver_;  // 실시간 수신(클라이언트) 모드
+  BinStreamer streamer_;        // 재생(서버) 모드
+  IqReceiver receiver_;         // 실시간 수신(클라이언트) 모드
+  WbViewerReceiver wbReceiver_; // 광대역 WB Viewer(WBSG/ZeroMQ) 모드
 };
