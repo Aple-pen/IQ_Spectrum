@@ -37,6 +37,15 @@ int main() {
 
   ImGuiIO &io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  // Multi-viewport: ImGui 창을 메인 윈도우 밖으로 끌어내면 별도 OS 창이 된다
+  // (Zone Configuration / Constellation 등을 다른 모니터에 띄울 수 있다).
+  io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+  {
+    // 분리된 플랫폼 창은 투명/둥근 모서리를 지원하지 않으므로 불투명·직각으로.
+    ImGuiStyle &style = ImGui::GetStyle();
+    style.WindowRounding = 0.0f;
+    style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+  }
 
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init(glslVersion);
@@ -60,6 +69,16 @@ int main() {
     glClearColor(0.06f, 0.07f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // 메인 윈도우 밖으로 끌어낸 창들을 각자의 OS 창에 그린다. 현재 GL 컨텍스트를
+    // 바꾸므로 호출 후 원래 컨텍스트로 복구해야 한다.
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+      GLFWwindow *backupContext = glfwGetCurrentContext();
+      ImGui::UpdatePlatformWindows();
+      ImGui::RenderPlatformWindowsDefault();
+      glfwMakeContextCurrent(backupContext);
+    }
+
     glfwSwapBuffers(window);
   };
 

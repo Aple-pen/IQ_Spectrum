@@ -7,6 +7,7 @@
 #include <imgui.h>
 #include <implot.h>
 
+#include "constants.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -34,9 +35,11 @@ namespace {
 // 다운샘플(max-pooling)해 렌더 비용을 상한으로 묶는다. 화면 폭보다 크게 그려도
 // 어차피 보이지 않으므로 시각적 손실은 거의 없다.
 constexpr int kMaxSpectrogramCols = 1024;
-// 스펙트로그램 히트맵의 최대 표시 행 수. History rows 를 크게 잡아 오래 저장해도,
-// 화면에 그리는 행은 이 값으로 max-pool 다운샘플해 렌더 비용(셀=행×열)을 묶는다.
-constexpr int kMaxSpectrogramRows = 512;
+// 스펙트로그램 히트맵의 최대 표시 행 수(무조건 상한). History rows 를 더 크게
+// 잡아 오래 저장해도 화면에는 최대 이 행수까지만 그린다. 각 사이클을 80행으로
+// decimation 하므로 240 = 최근 3사이클 분량. PlotHeatmap 은 셀당 사각형을
+// 하나씩 그리므로 렌더 비용은 셀 수(행×열)에 비례한다.
+constexpr int kMaxSpectrogramRows = 240;
 
 int PushImGuiTheme(bool dark) {
   if (dark) {
@@ -217,6 +220,41 @@ void App::LoadSettings(const char *path) {
                 wbTopic_.size() - 1);
     } else if (key == "wbLinesPerCycle") {
       wbLinesPerCycle_ = std::stoi(val);
+    } else if (key == "wbCmdPort") {
+      wbCmdPort_ = std::stoi(val);
+    } else if (key == "wbQueueCount") {
+      wbQueueCount_ = std::stoi(val);
+    } else if (key == "wbFrameCount") {
+      wbFrameCount_ = std::stoi(val);
+    } else if (key == "wbZoneFile") {
+      strncpy_s(zoneFilePath_.data(), zoneFilePath_.size(), val.c_str(),
+                zoneFilePath_.size() - 1);
+    } else if (key == "wbZones") {
+      // 형식: "start,stop,bw;start,stop,bw;..."
+      std::vector<WbZone> parsed;
+      std::stringstream zs(val);
+      std::string zone;
+      while (std::getline(zs, zone, ';')) {
+        if (zone.find_first_not_of(" \t\r\n") == std::string::npos)
+          continue;
+        std::stringstream fs(zone);
+        std::string a, b, c;
+        if (std::getline(fs, a, ',') && std::getline(fs, b, ',') &&
+            std::getline(fs, c, ',')) {
+          try {
+            WbZone z;
+            z.startFreqKHz = std::stoi(a);
+            z.stopFreqKHz = std::stoi(b);
+            z.bwCode = std::stoi(c);
+            parsed.push_back(z);
+          } catch (...) {
+            // 손상된 항목은 건너뜀
+          }
+        }
+      }
+      if (!parsed.empty()) {
+        wbZones_ = std::move(parsed);
+      }
     } else if (key == "fftSize") {
       const int v = std::stoi(val);
       // Snap to nearest valid power-of-two >= 256
@@ -285,6 +323,18 @@ void App::SaveSettings(const char *path) const {
   f << "wbPort=" << wbPort_ << '\n';
   f << "wbTopic=" << wbTopic_.data() << '\n';
   f << "wbLinesPerCycle=" << wbLinesPerCycle_ << '\n';
+  f << "wbCmdPort=" << wbCmdPort_ << '\n';
+  f << "wbQueueCount=" << wbQueueCount_ << '\n';
+  f << "wbFrameCount=" << wbFrameCount_ << '\n';
+  f << "wbZoneFile=" << zoneFilePath_.data() << '\n';
+  f << "wbZones=";
+  for (size_t i = 0; i < wbZones_.size(); ++i) {
+    if (i)
+      f << ';';
+    f << wbZones_[i].startFreqKHz << ',' << wbZones_[i].stopFreqKHz << ','
+      << wbZones_[i].bwCode;
+  }
+  f << '\n';
   f << "fftSize=" << fftSize_ << '\n';
   f << "chunkBytes=" << chunkBytes_ << '\n';
   f << "sendIntervalMs=" << sendIntervalMs_ << '\n';
@@ -328,13 +378,23 @@ void App::Render() {
     spectrogramHead_ = 0;
     spectrogramFill_ = 0;
     lastFftFrameCount_ = 0;
+    // WB 스펙트럼 애니메이션 상태도 리셋
+    wbSpectrumBlock_.reset();
+    wbSpectrumCycle_ = 0;
+    wbSpectrumRow_ = 0;
+    wbSpectrumBlockRows_ = 0;
   }
 
   const StreamSnapshot snapshot = Active().Snapshot();
 
   const int themeColors = PushImGuiTheme(chartDark_);
-  ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-  ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
+  // 멀티뷰포트가 켜져 있으면 창 좌표가 데스크톱 절대 좌표다. (0,0) + DisplaySize
+  // 로 두면 메인 창이 뷰포트 밖으로 나간 것으로 판정되어 자기 자신이 별도 OS
+  // 창으로 떨어져 나간다. 메인 뷰포트에 명시적으로 고정한다.
+  const ImGuiViewport *mainViewport = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(mainViewport->WorkPos, ImGuiCond_Always);
+  ImGui::SetNextWindowSize(mainViewport->WorkSize, ImGuiCond_Always);
+  ImGui::SetNextWindowViewport(mainViewport->ID);
   ImGui::Begin("Bin TCP Spectrum", nullptr,
                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_NoCollapse |
@@ -345,6 +405,12 @@ void App::Render() {
   RenderSpectrum(snapshot, 0.0f);
 
   ImGui::End();
+
+  // Zone 설정 창은 메인 창과 분리된 별도 윈도우. 테마 색을 공유하도록 pop 전에.
+  if (showZoneConfig_ && mode_ == static_cast<int>(Mode::Wideband)) {
+    RenderZoneConfig();
+  }
+
   ImGui::PopStyleColor(themeColors);
 
   if (showConstellation_) {
@@ -394,6 +460,249 @@ StreamConfig App::BuildConfig() const {
     config.chunkBytes = chunkBytes_;
   }
   return config;
+}
+
+bool App::SaveZones(const char *path, std::string &error) const {
+  if (path == nullptr || path[0] == '\0') {
+    error = "no file path";
+    return false;
+  }
+  std::ofstream f(path);
+  if (!f) {
+    error = std::string("cannot open for write: ") + path;
+    return false;
+  }
+  f << "# iq_spectrum zone configuration\n";
+  f << "# zone=<start_kHz>,<stop_kHz>,<bwCode>  "
+       "(bw 0=200 1=100 2=24 3=12 4=6 MHz)\n";
+  f << "version=1\n";
+  f << "queueCount=" << wbQueueCount_ << '\n';
+  f << "frameCount=" << wbFrameCount_ << '\n';
+  for (const WbZone &z : wbZones_) {
+    f << "zone=" << z.startFreqKHz << ',' << z.stopFreqKHz << ',' << z.bwCode
+      << '\n';
+  }
+  if (!f) {
+    error = "write failed";
+    return false;
+  }
+  return true;
+}
+
+bool App::LoadZones(const char *path, std::string &error) {
+  if (path == nullptr || path[0] == '\0') {
+    error = "no file path";
+    return false;
+  }
+  std::ifstream f(path);
+  if (!f) {
+    error = std::string("cannot open: ") + path;
+    return false;
+  }
+
+  auto trim = [](const std::string &s) -> std::string {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+      return std::string();
+    }
+    return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
+  };
+  auto parseInt = [&](const std::string &cell, int &out) -> bool {
+    const std::string t = trim(cell);
+    if (t.empty()) {
+      return false;
+    }
+    try {
+      size_t pos = 0;
+      const long long v = std::stoll(t, &pos);
+      if (pos != t.size() || v < 0 ||
+          v > static_cast<long long>(std::numeric_limits<int>::max())) {
+        return false;
+      }
+      out = static_cast<int>(v);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+
+  // 전부 성공했을 때만 반영하도록 로컬에 먼저 담는다(로드 실패 시 기존 설정 보존).
+  std::vector<WbZone> zones;
+  int queueCount = wbQueueCount_;
+  int frameCount = wbFrameCount_;
+  std::string line;
+  size_t lineNo = 0;
+
+  while (std::getline(f, line)) {
+    ++lineNo;
+    const std::string t = trim(line);
+    if (t.empty() || t[0] == '#' || t[0] == '[') {
+      continue; // 빈 줄 / 주석 / 섹션 헤더
+    }
+    const size_t eq = t.find('=');
+    if (eq == std::string::npos) {
+      error = "line " + std::to_string(lineNo) + ": expected key=value";
+      return false;
+    }
+    const std::string key = trim(t.substr(0, eq));
+    const std::string val = trim(t.substr(eq + 1));
+
+    if (key == "zone") {
+      std::stringstream ss(val);
+      std::string a, b, c;
+      if (!std::getline(ss, a, ',') || !std::getline(ss, b, ',') ||
+          !std::getline(ss, c, ',')) {
+        error = "line " + std::to_string(lineNo) +
+                ": zone needs start,stop,bw";
+        return false;
+      }
+      WbZone z;
+      if (!parseInt(a, z.startFreqKHz) || !parseInt(b, z.stopFreqKHz) ||
+          !parseInt(c, z.bwCode)) {
+        error = "line " + std::to_string(lineNo) + ": bad zone value";
+        return false;
+      }
+      if (z.bwCode < 0 || z.bwCode > 4) {
+        error = "line " + std::to_string(lineNo) + ": bw must be 0..4";
+        return false;
+      }
+      zones.push_back(z);
+    } else if (key == "queueCount") {
+      if (!parseInt(val, queueCount)) {
+        error = "line " + std::to_string(lineNo) + ": bad queueCount";
+        return false;
+      }
+    } else if (key == "frameCount") {
+      if (!parseInt(val, frameCount)) {
+        error = "line " + std::to_string(lineNo) + ": bad frameCount";
+        return false;
+      }
+    }
+    // 그 밖의 key(version 포함)는 무시 — 전방 호환.
+  }
+
+  if (zones.empty()) {
+    error = "no zone= entries found";
+    return false;
+  }
+  if (zones.size() > 64) {
+    error = "too many zones (" + std::to_string(zones.size()) + " > 64)";
+    return false;
+  }
+
+  wbZones_ = std::move(zones);
+  wbQueueCount_ = queueCount;
+  wbFrameCount_ = frameCount;
+  return true;
+}
+
+bool App::BrowseZoneFile(bool save) {
+  OPENFILENAMEA ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = nullptr;
+  ofn.lpstrFilter = "Zone config (*.zone)\0*.zone\0All files (*.*)\0*.*\0";
+  ofn.lpstrFile = zoneFilePath_.data();
+  ofn.nMaxFile = static_cast<DWORD>(zoneFilePath_.size());
+  ofn.lpstrDefExt = "zone";
+  if (save) {
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetSaveFileNameA(&ofn) == TRUE;
+  }
+  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+  return GetOpenFileNameA(&ofn) == TRUE;
+}
+
+void App::SnapZoneStop(WbZone &zone) {
+  const int bw = constants::WB::BW_KHz[std::clamp(zone.bwCode, 0, 4)];
+  const long long start = zone.startFreqKHz;
+  long long span = static_cast<long long>(zone.stopFreqKHz) - start;
+  // 이미 배수면 그대로 둔다(사용자 입력 보존).
+  if (span > 0 && (span % bw) == 0) {
+    return;
+  }
+  // 가장 가까운 배수로 반올림. 0 이하로 떨어지면 최소 1스텝.
+  long long steps = (span + bw / 2) / bw;
+  if (steps < 1) {
+    steps = 1;
+  }
+  long long stop = start + steps * bw;
+  // 상한(800000000 kHz)을 넘으면 스텝을 줄여 맞춘다.
+  while (stop > 800000000LL && steps > 1) {
+    --steps;
+    stop = start + steps * bw;
+  }
+  zone.stopFreqKHz = static_cast<int>(stop);
+}
+
+bool App::ValidateZones(std::string &error) const {
+  const int n = static_cast<int>(wbZones_.size());
+  if (n < 1 || n > 64) {
+    error = "num_zones must be 1..64 (now " + std::to_string(n) + ")";
+    return false;
+  }
+  if (wbQueueCount_ <= 0 || (wbQueueCount_ % 4) != 0) {
+    error = "queue_count must be a positive multiple of 4";
+    return false;
+  }
+  if (wbFrameCount_ < 1 || wbFrameCount_ > 65535) {
+    error = "frame_count must be 1..65535";
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    const WbZone &z = wbZones_[static_cast<size_t>(i)];
+    const std::string zi = "zone " + std::to_string(i) + ": ";
+    if (z.bwCode < 0 || z.bwCode > 4) {
+      error = zi + "bw code must be 0..4";
+      return false;
+    }
+    if (z.startFreqKHz < 400000 || z.startFreqKHz > 800000000 ||
+        z.stopFreqKHz < 400000 || z.stopFreqKHz > 800000000) {
+      error = zi + "freq out of range (400000..800000000 kHz)";
+      return false;
+    }
+    if (z.startFreqKHz >= z.stopFreqKHz) {
+      error = zi + "start_freq must be < stop_freq";
+      return false;
+    }
+    const long long bw = constants::WB::BW_KHz[z.bwCode];
+    if ((static_cast<long long>(z.stopFreqKHz - z.startFreqKHz) % bw) != 0) {
+      error = zi + "(stop-start) must be a multiple of bw (" +
+              std::to_string(bw) + " kHz)";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool App::BuildZoneConfigMsg(std::vector<uint8_t> &out,
+                             std::string &error) const {
+  if (!ValidateZones(error)) {
+    return false;
+  }
+  auto putBE = [](std::vector<uint8_t> &b, uint32_t v) {
+    b.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+    b.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    b.push_back(static_cast<uint8_t>(v & 0xFF));
+  };
+  out.clear();
+  out.reserve(16 + 16 * wbZones_.size());
+  // Header 16B: magic "WCMD" + num_zones + queue_cnt + frame_count (big-endian)
+  out.push_back(0x57); // W
+  out.push_back(0x43); // C
+  out.push_back(0x4D); // M
+  out.push_back(0x44); // D
+  putBE(out, static_cast<uint32_t>(wbZones_.size()));
+  putBE(out, static_cast<uint32_t>(wbQueueCount_));
+  putBE(out, static_cast<uint32_t>(wbFrameCount_));
+  // Zone Entry 16B × N: start_freq + stop_freq + bw + reserved (big-endian)
+  for (const WbZone &z : wbZones_) {
+    putBE(out, static_cast<uint32_t>(z.startFreqKHz));
+    putBE(out, static_cast<uint32_t>(z.stopFreqKHz));
+    putBE(out, static_cast<uint32_t>(z.bwCode));
+    putBE(out, 0u);
+  }
+  return true;
 }
 
 void App::BrowseFile() {
@@ -470,13 +779,30 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
     ImGui::TextColored(infoColor, "tcp://%s:%d  topic=\"%s\"", serverIp_.data(),
                        wbPort_, wbTopic_.data());
     ImGui::Checkbox("Auto-reconnect", &loop_);
-    // 사이클당 스펙트로그램 행 수. 0 = 사이클의 실제 dwell 행 수 그대로(압축 없음).
+    // 사이클당 스펙트로그램 행 수. 0 = 사이클의 실제 dwell 행 수 그대로(압축
+    // 없음).
     ImGui::InputInt("Lines/cycle (0=auto)", &wbLinesPerCycle_);
     if (wbLinesPerCycle_ < 0)
       wbLinesPerCycle_ = 0;
     if (wbLinesPerCycle_ > 4096)
       wbLinesPerCycle_ = 4096;
     ImGui::TextColored(infoColor, "WBSG v2 cycle snapshot (self-describing)");
+
+    // --- Zone Configuration (MSG-001) ---
+    // Start 시 이 값으로 MSG-001 을 만들어 wb_scann REP(Cmd port)에 REQ 로
+    // 보낸다. 실제 편집은 별도 창(RenderZoneConfig)에서 한다.
+    ImGui::Separator();
+    ImGui::TextColored(accent, "Zone Config (MSG-001, on Start)");
+    if (ImGui::Button("Zone settings...", ImVec2(-1, 0))) {
+      showZoneConfig_ = true;
+    }
+    std::string zerr;
+    if (ValidateZones(zerr)) {
+      ImGui::TextColored(infoColor, "%d zone(s), cmd port %d",
+                         static_cast<int>(wbZones_.size()), wbCmdPort_);
+    } else {
+      ImGui::TextColored(warnColor, "%s", zerr.c_str());
+    }
   } else if (!receiveMode) {
     // 재생(서버) 모드: 파일 + bind IP/listen 포트
     ImGui::TextColored(accent, "Source");
@@ -562,110 +888,110 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
     }
   }
 
-  // 아래 FFT/샘플/채널/HMFT 섹션은 IQ·HMFT 경로 전용이라 WB Viewer 모드에서는 숨김
-  // (WBSG 는 자기기술 포맷이라 이 설정들이 필요 없다).
+  // 아래 FFT/샘플/채널/HMFT 섹션은 IQ·HMFT 경로 전용이라 WB Viewer 모드에서는
+  // 숨김 (WBSG 는 자기기술 포맷이라 이 설정들이 필요 없다).
   if (!wideband) {
-  ImGui::Separator();
-  ImGui::TextColored(accent, "FFT");
-  {
-    static const int kFftSizes[] = {256, 512, 1024, 2048, 4096, 8192, 16384};
-    static const char *kFftLabels[] = {"256",  "512",  "1024", "2048",
-                                       "4096", "8192", "16384"};
-    constexpr int kFftCount = 7;
+    ImGui::Separator();
+    ImGui::TextColored(accent, "FFT");
+    {
+      static const int kFftSizes[] = {256, 512, 1024, 2048, 4096, 8192, 16384};
+      static const char *kFftLabels[] = {"256",  "512",  "1024", "2048",
+                                         "4096", "8192", "16384"};
+      constexpr int kFftCount = 7;
 
-    // Helper: snap fs/rbw to nearest valid FFT size >= 256
-    auto rbwToFftSize = [&](float rbw) -> int {
-      if (rbw <= 0.0f || sampleRateHz_ <= 0.0f)
-        return fftSize_;
-      const float ideal = sampleRateHz_ / rbw;
-      int best = kFftSizes[0];
-      float bestDist = std::abs(ideal - static_cast<float>(best));
-      for (int i = 1; i < kFftCount; ++i) {
-        const float d = std::abs(ideal - static_cast<float>(kFftSizes[i]));
-        if (d < bestDist) {
-          bestDist = d;
-          best = kFftSizes[i];
+      // Helper: snap fs/rbw to nearest valid FFT size >= 256
+      auto rbwToFftSize = [&](float rbw) -> int {
+        if (rbw <= 0.0f || sampleRateHz_ <= 0.0f)
+          return fftSize_;
+        const float ideal = sampleRateHz_ / rbw;
+        int best = kFftSizes[0];
+        float bestDist = std::abs(ideal - static_cast<float>(best));
+        for (int i = 1; i < kFftCount; ++i) {
+          const float d = std::abs(ideal - static_cast<float>(kFftSizes[i]));
+          if (d < bestDist) {
+            bestDist = d;
+            best = kFftSizes[i];
+          }
         }
-      }
-      return best;
-    };
+        return best;
+      };
 
-    int curIdx = 0;
-    for (int i = 0; i < kFftCount; ++i)
-      if (kFftSizes[i] == fftSize_) {
-        curIdx = i;
-        break;
+      int curIdx = 0;
+      for (int i = 0; i < kFftCount; ++i)
+        if (kFftSizes[i] == fftSize_) {
+          curIdx = i;
+          break;
+        }
+
+      if (ImGui::BeginCombo("FFT size", kFftLabels[curIdx])) {
+        for (int i = 0; i < kFftCount; ++i) {
+          const bool selected = (i == curIdx);
+          if (ImGui::Selectable(kFftLabels[i], selected))
+            fftSize_ = kFftSizes[i];
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
       }
 
-    if (ImGui::BeginCombo("FFT size", kFftLabels[curIdx])) {
-      for (int i = 0; i < kFftCount; ++i) {
-        const bool selected = (i == curIdx);
-        if (ImGui::Selectable(kFftLabels[i], selected))
-          fftSize_ = kFftSizes[i];
-        if (selected)
+      // RBW display/edit: RBW = fs / N
+      float rbw = (sampleRateHz_ > 0.0f && fftSize_ > 0)
+                      ? sampleRateHz_ / static_cast<float>(fftSize_)
+                      : 0.0f;
+      if (ImGui::InputFloat("RBW (Hz)", &rbw, 0.0f, 0.0f, "%.2f")) {
+        fftSize_ = rbwToFftSize(rbw);
+      }
+    }
+    ImGui::InputFloat("Sample rate Hz", &sampleRateHz_);
+    if (ImGui::BeginCombo("Sample format",
+                          SampleFormatName(sampleFormatIndex_))) {
+      for (int index = 0; index < 3; ++index) {
+        const bool selected = sampleFormatIndex_ == index;
+        if (ImGui::Selectable(SampleFormatName(index), selected)) {
+          sampleFormatIndex_ = index;
+        }
+        if (selected) {
           ImGui::SetItemDefaultFocus();
+        }
       }
       ImGui::EndCombo();
     }
+    ImGui::InputInt("Channels", &channels_);
+    if (channels_ < 1) {
+      channels_ = 1;
+    }
+    ImGui::InputInt("Channel index", &channelIndex_);
+    if (channelIndex_ < 0) {
+      channelIndex_ = 0;
+    }
+    if (channelIndex_ >= channels_) {
+      channelIndex_ = channels_ - 1;
+    }
+    if (channels_ > 1) {
+      ImGui::TextColored(infoColor, "Multi-ch: using ch %d of %d",
+                         channelIndex_, channels_ - 1);
+    }
 
-    // RBW display/edit: RBW = fs / N
-    float rbw = (sampleRateHz_ > 0.0f && fftSize_ > 0)
-                    ? sampleRateHz_ / static_cast<float>(fftSize_)
-                    : 0.0f;
-    if (ImGui::InputFloat("RBW (Hz)", &rbw, 0.0f, 0.0f, "%.2f")) {
-      fftSize_ = rbwToFftSize(rbw);
-    }
-  }
-  ImGui::InputFloat("Sample rate Hz", &sampleRateHz_);
-  if (ImGui::BeginCombo("Sample format",
-                        SampleFormatName(sampleFormatIndex_))) {
-    for (int index = 0; index < 3; ++index) {
-      const bool selected = sampleFormatIndex_ == index;
-      if (ImGui::Selectable(SampleFormatName(index), selected)) {
-        sampleFormatIndex_ = index;
+    // HMFT 헤더는 광대역 스캔(1채널) 모드 전용.
+    if (channels_ == 1) {
+      ImGui::Separator();
+      ImGui::TextColored(accent, "Frame Header");
+      ImGui::Checkbox("HMFT header (16B/2048)", &hmftHeader_);
+      if (hmftHeader_) {
+        if (snapshot.hmftValid) {
+          // 대역폭 코드 -> MHz (200M=0,100M=1,20M=2,10M=3,5M=4)
+          static const char *kBwName[] = {"200M", "100M", "20M", "10M", "5M"};
+          const char *bw = (snapshot.hmftBwCode >= 0 && snapshot.hmftBwCode < 5)
+                               ? kBwName[snapshot.hmftBwCode]
+                               : "?";
+          ImGui::TextColored(
+              infoColor, "seq %u  BW %s  Center %.3f MHz", snapshot.hmftSeq, bw,
+              static_cast<double>(snapshot.hmftCenterKHz) / 1000.0);
+        } else {
+          ImGui::TextColored(warnColor, "No HMFT magic parsed yet");
+        }
       }
-      if (selected) {
-        ImGui::SetItemDefaultFocus();
-      }
-    }
-    ImGui::EndCombo();
-  }
-  ImGui::InputInt("Channels", &channels_);
-  if (channels_ < 1) {
-    channels_ = 1;
-  }
-  ImGui::InputInt("Channel index", &channelIndex_);
-  if (channelIndex_ < 0) {
-    channelIndex_ = 0;
-  }
-  if (channelIndex_ >= channels_) {
-    channelIndex_ = channels_ - 1;
-  }
-  if (channels_ > 1) {
-    ImGui::TextColored(infoColor, "Multi-ch: using ch %d of %d", channelIndex_,
-                       channels_ - 1);
-  }
-
-  // HMFT 헤더는 광대역 스캔(1채널) 모드 전용.
-  if (channels_ == 1) {
-  ImGui::Separator();
-  ImGui::TextColored(accent, "Frame Header");
-  ImGui::Checkbox("HMFT header (16B/2048)", &hmftHeader_);
-  if (hmftHeader_) {
-    if (snapshot.hmftValid) {
-      // 대역폭 코드 -> MHz (200M=0,100M=1,20M=2,10M=3,5M=4)
-      static const char *kBwName[] = {"200M", "100M", "20M", "10M", "5M"};
-      const char *bw = (snapshot.hmftBwCode >= 0 && snapshot.hmftBwCode < 5)
-                           ? kBwName[snapshot.hmftBwCode]
-                           : "?";
-      ImGui::TextColored(infoColor, "seq %u  BW %s  Center %.3f MHz",
-                         snapshot.hmftSeq, bw,
-                         static_cast<double>(snapshot.hmftCenterKHz) / 1000.0);
-    } else {
-      ImGui::TextColored(warnColor, "No HMFT magic parsed yet");
-    }
-  }
-  } // channels_ == 1
+    } // channels_ == 1
   } // !wideband (FFT/샘플/채널/HMFT 섹션)
 
   ImGui::Separator();
@@ -682,8 +1008,9 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   ImGui::TextColored(accent, "Spectrogram");
   ImGui::Checkbox("Show spectrogram", &showSpectrogram_);
   if (showSpectrogram_) {
-    // 유지할 시간 행 수. WB 모드는 사이클당 여러 dwell 행(예: 480)이 들어오므로,
-    // 한 사이클을 온전히 보려면 이 값을 사이클 행 수(Lines/cycle) 이상으로 둔다.
+    // 유지할 시간 행 수. WB 모드는 사이클당 여러 dwell 행(예: 480)이
+    // 들어오므로, 한 사이클을 온전히 보려면 이 값을 사이클 행 수(Lines/cycle)
+    // 이상으로 둔다.
     ImGui::InputInt("History rows", &spectrogramRows_);
     if (spectrogramRows_ < 10)
       spectrogramRows_ = 10;
@@ -737,11 +1064,36 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
       std::string error;
       bool ok = false;
       if (wideband) {
-        ok = wbReceiver_.Start(BuildConfig(), error);
+        // Start 시 먼저 MSG-001(Zone Configuration)을 wb_scann 제어 채널로
+        // 보내고, WRSP status 가 정상(0)일 때만 WBSG SUB 수신을 시작한다.
+        std::vector<uint8_t> msg;
+        std::string zerr;
+        if (!BuildZoneConfigMsg(msg, zerr)) {
+          error = "Zone config invalid: " + zerr;
+        } else {
+          uint32_t status = 0;
+          std::string magic;
+          std::string reqErr;
+          if (!WbViewerReceiver::RequestZoneConfig(
+                  serverIp_.data(),
+                  static_cast<uint16_t>(std::clamp(wbCmdPort_, 1, 65535)), msg,
+                  reqErr, status, magic)) {
+            error = "Zone config request failed: " + reqErr;
+          } else if (status != 0) {
+            error = "Zone config rejected (magic=" + magic +
+                    " status=" + std::to_string(status) + ")";
+          } else {
+            ok = wbReceiver_.Start(BuildConfig(), error);
+          }
+        }
       } else if (receiveMode) {
         ok = receiver_.Start(BuildConfig(), error);
       } else {
         ok = streamer_.Start(BuildConfig(), error);
+      }
+      if (!ok && error.empty()) {
+        // (방어) 이유 없는 실패는 일반 메시지로
+        error = "Start failed";
       }
       if (!ok) {
         lastError_ = error;
@@ -784,7 +1136,9 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   }
   ImGui::Text("Connected: %s", snapshot.connected ? "yes" : "no");
   const bool recvLike = receiveMode || wideband;
-  ImGui::Text("%s: %llu", wideband ? "Cycles" : (recvLike ? "Recv packets" : "Sent packets"),
+  ImGui::Text("%s: %llu",
+              wideband ? "Cycles"
+                       : (recvLike ? "Recv packets" : "Sent packets"),
               static_cast<unsigned long long>(snapshot.packetsSent));
   ImGui::Text("%s: %llu", recvLike ? "Recv bytes" : "Sent bytes",
               static_cast<unsigned long long>(snapshot.bytesSent));
@@ -840,32 +1194,98 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
   const bool haveData =
       specN > 0 && snapshot.frequencies.size() == snapshot.magnitudesDb.size();
 
+  // --- WB 스펙트럼 애니메이션 ---
+  // 한 사이클이 dwell n행을 담고 있으면, 상단 스펙트럼 라인은 그 n행을 매
+  // 프레임 1행씩 순차적으로 그린다(라이브 스윕). 다 그리기 전에 다음 사이클이
+  // 오면 (fftFrameCount 변화) 그 사이클의 0행부터 다시 시작한다. 스펙트로그램은
+  // 별개로 n행 전부 누적된다. 그리는 값 소스: 기본은 magnitudesDb(요약), WB
+  // 애니메이션 중이면 현재 행.
+  const float *specMags = haveData ? snapshot.magnitudesDb.data() : nullptr;
+  bool animating = false;
+  if (haveData && snapshot.spectrogramBlock &&
+      snapshot.spectrogramBlockRows > 0 &&
+      static_cast<int>(snapshot.spectrogramBlock->size()) ==
+          snapshot.spectrogramBlockRows * specN) {
+    if (snapshot.fftFrameCount != wbSpectrumCycle_) {
+      // 새 사이클: 0행부터 다시 시작하고, 이 사이클 전체 기준으로 y 스케일
+      // 고정.
+      wbSpectrumCycle_ = snapshot.fftFrameCount;
+      wbSpectrumBlock_ = snapshot.spectrogramBlock;
+      wbSpectrumBlockRows_ = snapshot.spectrogramBlockRows;
+      wbSpectrumRow_ = 0;
+      double bmin = 0.0;
+      double bmax = 0.0;
+      bool any = false;
+      for (float v : *wbSpectrumBlock_) {
+        if (std::isfinite(v)) {
+          if (!any) {
+            bmin = bmax = v;
+            any = true;
+          } else {
+            bmin = std::min(bmin, static_cast<double>(v));
+            bmax = std::max(bmax, static_cast<double>(v));
+          }
+        }
+      }
+      const double margin = any ? std::max(6.0, (bmax - bmin) * 0.15) : 6.0;
+      wbSpectrumYMin_ = (any ? bmin : -160.0) - margin;
+      wbSpectrumYMax_ = (any ? bmax : 10.0) + margin;
+    }
+    if (wbSpectrumBlock_ && wbSpectrumRow_ < wbSpectrumBlockRows_ &&
+        static_cast<int>(wbSpectrumBlock_->size()) ==
+            wbSpectrumBlockRows_ * specN) {
+      specMags = wbSpectrumBlock_->data() +
+                 static_cast<size_t>(wbSpectrumRow_) * specN;
+      animating = true;
+      // 다음 프레임을 위해 한 행 전진(마지막 행에서 홀드; 새 사이클이 리셋).
+      if (wbSpectrumRow_ + 1 < wbSpectrumBlockRows_) {
+        ++wbSpectrumRow_;
+      }
+    }
+  }
+
   // y축 한계는 전체 스펙트럼 기준으로 한 번만 계산해 모든 단이 공유하도록 한다.
+  // 애니메이션 중이면 사이클 전체 기준 고정 스케일을 써서 행마다 튀지 않게
+  // 한다.
   double yMin = -160.0;
   double yMax = 10.0;
   if (haveData) {
     if (yAxisAuto_) {
-      bool hasFinite = false;
-      for (float value : snapshot.magnitudesDb) {
-        if (std::isfinite(value)) {
-          if (!hasFinite) {
-            yMin = value;
-            yMax = value;
-            hasFinite = true;
-          } else {
-            yMin = std::min(yMin, static_cast<double>(value));
-            yMax = std::max(yMax, static_cast<double>(value));
+      if (animating) {
+        yMin = wbSpectrumYMin_;
+        yMax = wbSpectrumYMax_;
+      } else {
+        bool hasFinite = false;
+        for (float value : snapshot.magnitudesDb) {
+          if (std::isfinite(value)) {
+            if (!hasFinite) {
+              yMin = value;
+              yMax = value;
+              hasFinite = true;
+            } else {
+              yMin = std::min(yMin, static_cast<double>(value));
+              yMax = std::max(yMax, static_cast<double>(value));
+            }
           }
         }
-      }
-      if (hasFinite) {
-        const double margin = std::max(6.0, (yMax - yMin) * 0.15);
-        yMin -= margin;
-        yMax += margin;
+        if (hasFinite) {
+          const double margin = std::max(6.0, (yMax - yMin) * 0.15);
+          yMin -= margin;
+          yMax += margin;
+        }
       }
     } else {
       yMin = static_cast<double>(yAxisMin_);
       yMax = static_cast<double>(yAxisMax_);
+    }
+    if (yAxisAuto_) {
+      // 오토스케일 값을 10 단위로 스냅. 사이클마다 미세하게 흔들리면 눈금 라벨과
+      // 축이 계속 다시 그려져 화면이 들썩인다.
+      yMin = std::floor(yMin / 10.0) * 10.0;
+      yMax = std::ceil(yMax / 10.0) * 10.0;
+      if (yMax <= yMin) {
+        yMax = yMin + 10.0;
+      }
     }
   }
 
@@ -873,8 +1293,8 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
       (spectrumTiers_ && haveData) ? std::max(1, spectrumTierCount_) : 1;
   const bool drawSgram = showSpectrogram_ && haveData;
 
-  // --- 스펙트로그램 링버퍼 누적 (레이아웃과 무관하게 전체 폭 기준으로 갱신) ---
-  // 링버퍼는 "전체 스펙트럼"을 한 행(row)으로 저장한다. 표시용 행렬은 열을
+  // --- 스펙트로그램 링버퍼 누적 (레이아웃과 무관하게 전체 폭 기준으로 갱신)
+  // --- 링버퍼는 "전체 스펙트럼"을 한 행(row)으로 저장한다. 표시용 행렬은 열을
   // 화면 해상도 수준(kMaxSpectrogramCols)으로 max-pooling 다운샘플해 둔다.
   // 광대역에서 bins = 슬라이스수*2048로 폭발하는데, PlotHeatmap은 셀당 사각형을
   // 하나씩 그리므로 다운샘플 없이는 매 프레임 수백만 셀을 그려 극도로 느려진다.
@@ -913,8 +1333,7 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
     if (snapshot.fftFrameCount > lastFftFrameCount_) {
       lastFftFrameCount_ = snapshot.fftFrameCount;
       const bool haveBlock =
-          snapshot.spectrogramBlock &&
-          snapshot.spectrogramBlockRows > 0 &&
+          snapshot.spectrogramBlock && snapshot.spectrogramBlockRows > 0 &&
           static_cast<int>(snapshot.spectrogramBlock->size()) ==
               snapshot.spectrogramBlockRows * bins;
       const int pushRows = haveBlock ? snapshot.spectrogramBlockRows : 1;
@@ -934,10 +1353,10 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
       spectrogramDirty_ = true;
     }
 
-    // 표시 행렬 재구성: 새 프레임/리셋이 있었을 때만. 저장된 fill 행(가장 오래된
-    // 것이 위쪽 index 0)을 표시 행 수(dsRows)로, 열을 dsCols 로 각각 max-pool
-    // 다운샘플한다(행·열 모두 피크 보존). fill 이 dsRows 보다 적으면 그대로 두고
-    // 나머지는 패딩(-180).
+    // 표시 행렬 재구성: 새 프레임/리셋이 있었을 때만. 저장된 fill 행(가장
+    // 오래된 것이 위쪽 index 0)을 표시 행 수(dsRows)로, 열을 dsCols 로 각각
+    // max-pool 다운샘플한다(행·열 모두 피크 보존). fill 이 dsRows 보다 적으면
+    // 그대로 두고 나머지는 패딩(-180).
     if (spectrogramDirty_ && spectrogramFill_ > 0) {
       std::fill(spectrogramDisp_.begin(), spectrogramDisp_.end(), -180.0f);
       const int srcRows = spectrogramFill_;
@@ -953,7 +1372,8 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
           rHi = r + 1;
         } else {
           rLo = static_cast<int>(static_cast<int64_t>(r) * srcRows / dsRows);
-          rHi = static_cast<int>(static_cast<int64_t>(r + 1) * srcRows / dsRows);
+          rHi =
+              static_cast<int>(static_cast<int64_t>(r + 1) * srcRows / dsRows);
           if (rHi <= rLo) {
             rHi = rLo + 1;
           }
@@ -963,9 +1383,9 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
         for (int oc = 0; oc < dsCols; ++oc) {
           const int c0 =
               static_cast<int>(static_cast<int64_t>(bins) * oc / dsCols);
-          const int c1 = std::max(
-              c0 + 1,
-              static_cast<int>(static_cast<int64_t>(bins) * (oc + 1) / dsCols));
+          const int c1 =
+              std::max(c0 + 1, static_cast<int>(static_cast<int64_t>(bins) *
+                                                (oc + 1) / dsCols));
           float m = -std::numeric_limits<float>::max();
           for (int sr = rLo; sr < rHi; ++sr) {
             const int ring = (spectrogramHead_ + sr) % spectrogramRows_;
@@ -1013,18 +1433,20 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
     specTierH = std::max(1.0f, totalPlotH / static_cast<float>(tierCount));
   }
 
-  // --- 단별 렌더: 스펙트럼을 그리고, 바로 아래 같은 주파수 구간 스펙트로그램 ---
+  // --- 단별 렌더: 스펙트럼을 그리고, 바로 아래 같은 주파수 구간 스펙트로그램
+  // ---
   const ImPlotColormap cmap =
       chartDark_ ? ImPlotColormap_Plasma : ImPlotColormap_Viridis;
-  // 스택된 플롯들의 축 여백(왼쪽 Y라벨 폭 등)을 정렬해, 스펙트럼과 스펙트로그램의
-  // x축 시작/끝 위치가 세로로 정확히 맞도록 한다. Y라벨 폭이 달라도(-160 vs 50)
-  // 플롯 영역이 어긋나지 않는다.
+  // 스택된 플롯들의 축 여백(왼쪽 Y라벨 폭 등)을 정렬해, 스펙트럼과
+  // 스펙트로그램의 x축 시작/끝 위치가 세로로 정확히 맞도록 한다. Y라벨 폭이
+  // 달라도(-160 vs 50) 플롯 영역이 어긋나지 않는다.
   const bool aligned = ImPlot::BeginAlignedPlots("##spectiers");
   for (int t = 0; t < tierCount; ++t) {
     int begin = 0;
     int count = haveData ? specN : 0;
     if (tierCount > 1) {
-      // 주파수 구간을 tierCount 등분. 단 사이가 끊기지 않도록 경계 샘플을 겹친다.
+      // 주파수 구간을 tierCount 등분. 단 사이가 끊기지 않도록 경계 샘플을
+      // 겹친다.
       begin = static_cast<int>(static_cast<int64_t>(specN) * t / tierCount);
       const int end =
           static_cast<int>(static_cast<int64_t>(specN) * (t + 1) / tierCount);
@@ -1033,19 +1455,19 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
     }
     char specId[40];
     std::snprintf(specId, sizeof(specId), "##spectrum_tier%d", t);
-    RenderSpectrumPlot(snapshot, specId, begin, count, yMin, yMax, broadband,
-                       specTierH);
+    RenderSpectrumPlot(snapshot.frequencies.data(), specMags, specId, begin,
+                       count, yMin, yMax, broadband, specTierH);
     if (sgramReady && count > 0) {
-      // 이 단의 주파수 구간은 스펙트럼 단과 동일하게 freq[begin..begin+count-1].
-      // 다운샘플된 표시 행렬에서 대응 열 구간을 비례로 잘라 같은 x축에 그린다.
+      // 이 단의 주파수 구간은 스펙트럼 단과 동일하게
+      // freq[begin..begin+count-1]. 다운샘플된 표시 행렬에서 대응 열 구간을
+      // 비례로 잘라 같은 x축에 그린다.
       const int dsCols = spectrogramDsCols_;
       const int dsBegin =
           static_cast<int>(static_cast<int64_t>(dsCols) * t / tierCount);
-      const int dsEnd =
-          (tierCount > 1)
-              ? static_cast<int>(static_cast<int64_t>(dsCols) * (t + 1) /
-                                 tierCount)
-              : dsCols;
+      const int dsEnd = (tierCount > 1)
+                            ? static_cast<int>(static_cast<int64_t>(dsCols) *
+                                               (t + 1) / tierCount)
+                            : dsCols;
       const int dsCount = std::max(1, dsEnd - dsBegin);
       const double xMin = static_cast<double>(snapshot.frequencies[begin]);
       const double xMax =
@@ -1066,26 +1488,27 @@ void App::RenderSpectrum(const StreamSnapshot &snapshot, float width) {
   ImGui::EndChild();
 }
 
-void App::RenderSpectrumPlot(const StreamSnapshot &snapshot, const char *plotId,
-                            int i0, int count, double yMin, double yMax,
-                            bool broadband, float height) {
+void App::RenderSpectrumPlot(const float *freqs, const float *mags,
+                             const char *plotId, int i0, int count, double yMin,
+                             double yMax, bool broadband, float height) {
   const ImVec2 plotSize(-1, height);
   if (!ImPlot::BeginPlot(plotId, plotSize)) {
     return;
   }
   ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
                     broadband ? "Level" : "Magnitude (dB)");
-  if (count > 0) {
-    const double xMin = static_cast<double>(snapshot.frequencies[i0]);
-    const double xMax =
-        static_cast<double>(snapshot.frequencies[i0 + count - 1]);
+  // y 눈금 라벨을 고정폭으로. 오토스케일로 자릿수가 바뀌면(-62 vs -198) 좌측
+  // 여백이 달라지고, 그만큼 플롯 폭이 변해 x축 눈금 간격이 간헐적으로 튄다.
+  ImPlot::SetupAxisFormat(ImAxis_Y1, "%6.0f");
+  if (count > 0 && freqs != nullptr && mags != nullptr) {
+    const double xMin = static_cast<double>(freqs[i0]);
+    const double xMax = static_cast<double>(freqs[i0 + count - 1]);
     ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
     ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
     ImPlot::PushStyleColor(ImPlotCol_Line,
                            chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f)
                                       : ImVec4(0.169f, 0.424f, 0.690f, 1.0f));
-    ImPlot::PlotLine("Magnitude", snapshot.frequencies.data() + i0,
-                     snapshot.magnitudesDb.data() + i0, count);
+    ImPlot::PlotLine("Magnitude", freqs + i0, mags + i0, count);
     ImPlot::PopStyleColor();
   } else {
     ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Always);
@@ -1106,40 +1529,244 @@ void App::RenderSpectrogramPlot(const char *plotId, int dsColBegin,
     return;
   }
 
-  // 다운샘플된 표시 행렬(row-major [row*dsCols + col])에서
-  // [dsColBegin, dsColBegin+dsColCount) 열만 잘라 연속 버퍼로 모은다.
-  // PlotHeatmap이 stride 없는 연속 배열을 요구하기 때문. 단마다 열 수가 ±1
-  // 달라질 수 있어 버퍼는 최대 크기로만 키운다.
+  // PlotHeatmap 은 셀당 사각형을 하나씩 그리므로, 실제로 보이는 것보다 더
+  // 촘촘히 그리면 낭비다(특히 단 스펙트로그램은 높이가 ~수백 px 뿐). 그래서 이
+  // 플롯의 실제 픽셀 크기(가로/세로)를 넘지 않도록 표시 행렬에서 다시 max-pool
+  // 다운샘플해 타일을 만든다. 렌더 셀 수를 화면 픽셀 수 이하로 묶어 상수 시간에
+  // 가깝게 한다.
+  const float availW = ImGui::GetContentRegionAvail().x;
+  // 행은 표시 상한(≤240)까지 전부 그린다(무조건 최대 240행). 열만 실제 플롯
+  // 픽셀 폭을 넘지 않게 max-pool 다운샘플한다.
+  const int renderRows = dsRows;
+  const int renderCols =
+      std::clamp(static_cast<int>(std::ceil(availW)), 1, dsColCount);
+
   const size_t tileSize =
-      static_cast<size_t>(dsRows) * static_cast<size_t>(dsColCount);
+      static_cast<size_t>(renderRows) * static_cast<size_t>(renderCols);
   if (spectrogramTile_.size() < tileSize) {
     spectrogramTile_.resize(tileSize);
   }
-  for (int r = 0; r < dsRows; ++r) {
-    const float *src = spectrogramDisp_.data() +
-                       static_cast<size_t>(r) * static_cast<size_t>(dsCols) +
-                       dsColBegin;
-    std::copy_n(src, dsColCount,
-                spectrogramTile_.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        static_cast<size_t>(r) *
-                        static_cast<size_t>(dsColCount)));
+  // disp 의 [dsColBegin, dsColBegin+dsColCount) × [0, dsRows) 영역을
+  // renderRows × renderCols 로 2D max-pool (행·열 모두 피크 보존).
+  for (int rr = 0; rr < renderRows; ++rr) {
+    const int r0 =
+        static_cast<int>(static_cast<int64_t>(rr) * dsRows / renderRows);
+    int r1 =
+        static_cast<int>(static_cast<int64_t>(rr + 1) * dsRows / renderRows);
+    if (r1 <= r0)
+      r1 = r0 + 1;
+    float *out = spectrogramTile_.data() +
+                 static_cast<size_t>(rr) * static_cast<size_t>(renderCols);
+    for (int cc = 0; cc < renderCols; ++cc) {
+      const int c0 = dsColBegin + static_cast<int>(static_cast<int64_t>(cc) *
+                                                   dsColCount / renderCols);
+      int c1 = dsColBegin + static_cast<int>(static_cast<int64_t>(cc + 1) *
+                                             dsColCount / renderCols);
+      if (c1 <= c0)
+        c1 = c0 + 1;
+      float m = -std::numeric_limits<float>::max();
+      for (int r = r0; r < r1; ++r) {
+        const float *srow =
+            spectrogramDisp_.data() +
+            static_cast<size_t>(r) * static_cast<size_t>(dsCols);
+        for (int c = c0; c < c1; ++c) {
+          m = std::max(m, srow[c]);
+        }
+      }
+      out[cc] = m;
+    }
   }
 
   const ImVec2 spectroSize(-1, height);
   if (ImPlot::BeginPlot(plotId, spectroSize)) {
     ImPlot::SetupAxes(broadband ? "Frequency (MHz)" : "Frequency (Hz)",
                       "Time (frames)");
+    // 스펙트럼 쪽과 같은 폭으로 맞춰 정렬 그룹의 좌측 여백을 고정한다.
+    ImPlot::SetupAxisFormat(ImAxis_Y1, "%6.0f");
     ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
-    ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, static_cast<double>(dsRows),
+    ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, static_cast<double>(renderRows),
                             ImGuiCond_Always);
-    ImPlot::PlotHeatmap("##heatmap", spectrogramTile_.data(), dsRows, dsColCount,
-                        static_cast<double>(scaleMin),
+    ImPlot::PlotHeatmap("##heatmap", spectrogramTile_.data(), renderRows,
+                        renderCols, static_cast<double>(scaleMin),
                         static_cast<double>(scaleMax), nullptr,
                         ImPlotPoint(xMin, 0.0),
-                        ImPlotPoint(xMax, static_cast<double>(dsRows)));
+                        ImPlotPoint(xMax, static_cast<double>(renderRows)));
     ImPlot::EndPlot();
   }
+}
+
+void App::RenderZoneConfig() {
+  ImGui::SetNextWindowSize(ImVec2(470, 540), ImGuiCond_FirstUseEver);
+  bool open = showZoneConfig_;
+  if (!ImGui::Begin("Zone Configuration (MSG-001)", &open)) {
+    ImGui::End();
+    showZoneConfig_ = open;
+    return;
+  }
+  showZoneConfig_ = open;
+
+  const ImVec4 accent = chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f)
+                                   : ImVec4(0.169f, 0.424f, 0.690f, 1.0f);
+  const ImVec4 warnColor = chartDark_ ? ImVec4(1.000f, 0.576f, 0.196f, 1.0f)
+                                      : ImVec4(0.851f, 0.400f, 0.051f, 1.0f);
+  const ImVec4 infoColor = chartDark_ ? ImVec4(0.353f, 0.953f, 0.647f, 1.0f)
+                                      : ImVec4(0.102f, 0.549f, 0.200f, 1.0f);
+
+  ImGui::TextColored(accent, "Sent to wb_scann on Start (REQ -> REP)");
+  ImGui::PushItemWidth(-140.0f);
+  ImGui::InputInt("Cmd port", &wbCmdPort_);
+  wbCmdPort_ = std::clamp(wbCmdPort_, 1, 65535);
+  ImGui::InputInt("Queue count (x4)", &wbQueueCount_);
+  ImGui::InputInt("Frame count", &wbFrameCount_);
+  ImGui::PopItemWidth();
+
+  ImGui::Separator();
+  ImGui::TextColored(accent, "Zones (%d / 64)",
+                     static_cast<int>(wbZones_.size()));
+  ImGui::TextColored(infoColor,
+                     "stop is snapped to the nearest multiple of bw");
+
+  int removeIdx = -1;
+  ImGui::BeginChild("zonelist", ImVec2(0, -64), true);
+  ImGui::PushItemWidth(-140.0f);
+  for (int i = 0; i < static_cast<int>(wbZones_.size()); ++i) {
+    ImGui::PushID(i);
+    WbZone &z = wbZones_[static_cast<size_t>(i)];
+    ImGui::TextColored(accent, "Zone %d", i);
+
+    // start/stop 은 타이핑 중에 값을 건드리면 방해되므로, 편집이 끝난 시점에만
+    // 스냅한다. bw 는 콤보 선택(단발 동작)이라 즉시 스냅.
+    ImGui::InputInt("start (kHz)", &z.startFreqKHz);
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      SnapZoneStop(z);
+    }
+    ImGui::InputInt("stop (kHz)", &z.stopFreqKHz);
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      SnapZoneStop(z);
+    }
+    const int bwSel = std::clamp(z.bwCode, 0, 4);
+    if (ImGui::BeginCombo("bw", constants::WB::BwLabel[bwSel])) {
+      for (int b = 0; b < 5; ++b) {
+        const bool selected = (z.bwCode == b);
+        if (ImGui::Selectable(constants::WB::BwLabel[b], selected)) {
+          z.bwCode = b;
+          SnapZoneStop(z); // bw 가 바뀌면 stop 을 새 bw 배수로 맞춘다
+        }
+        if (selected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+
+    // 스텝 수 / 실제 span 미리보기
+    const int bwKHz = constants::WB::BW_KHz[bwSel];
+    const long long span =
+        static_cast<long long>(z.stopFreqKHz) - z.startFreqKHz;
+    if (span > 0 && (span % bwKHz) == 0) {
+      ImGui::TextColored(infoColor, "  %lld steps  (%.3f ~ %.3f MHz)",
+                         span / bwKHz, z.startFreqKHz / 1000.0,
+                         z.stopFreqKHz / 1000.0);
+    } else {
+      ImGui::TextColored(warnColor, "  not aligned to bw");
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Snap")) {
+        SnapZoneStop(z);
+      }
+    }
+
+    if (wbZones_.size() > 1) {
+      if (ImGui::SmallButton("Remove")) {
+        removeIdx = i;
+      }
+    }
+    ImGui::PopID();
+    ImGui::Separator();
+  }
+  ImGui::PopItemWidth();
+  ImGui::EndChild();
+
+  if (removeIdx >= 0) {
+    wbZones_.erase(wbZones_.begin() + removeIdx);
+  }
+  if (wbZones_.size() < 64) {
+    if (ImGui::Button("Add zone", ImVec2(110, 0))) {
+      WbZone z;
+      if (!wbZones_.empty()) {
+        // 직전 zone 바로 뒤를 이어받아 시작 (연속 대역 구성 편의)
+        const WbZone &prev = wbZones_.back();
+        z.bwCode = prev.bwCode;
+        z.startFreqKHz = prev.stopFreqKHz;
+        z.stopFreqKHz = prev.stopFreqKHz +
+                        constants::WB::BW_KHz[std::clamp(z.bwCode, 0, 4)];
+        SnapZoneStop(z);
+      }
+      wbZones_.push_back(z);
+    }
+    ImGui::SameLine();
+  }
+  if (ImGui::Button("Snap all", ImVec2(110, 0))) {
+    for (WbZone &z : wbZones_) {
+      SnapZoneStop(z);
+    }
+  }
+
+  std::string zerr;
+  if (ValidateZones(zerr)) {
+    ImGui::TextColored(infoColor, "OK - %d zone(s), %zu bytes",
+                       static_cast<int>(wbZones_.size()),
+                       16 + 16 * wbZones_.size());
+  } else {
+    ImGui::TextColored(warnColor, "%s", zerr.c_str());
+  }
+
+  // --- Export / Import (뷰어 전용 *.zone 포맷) ---
+  ImGui::Separator();
+  ImGui::TextColored(accent, "Export / Import (*.zone)");
+  if (ImGui::Button("Export as...", ImVec2(110, 0))) {
+    if (BrowseZoneFile(true)) {
+      std::string err;
+      zoneFileStatus_ = SaveZones(zoneFilePath_.data(), err)
+                            ? "Exported: " + std::string(zoneFilePath_.data())
+                            : "Export failed: " + err;
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Import...", ImVec2(110, 0))) {
+    if (BrowseZoneFile(false)) {
+      std::string err;
+      if (LoadZones(zoneFilePath_.data(), err)) {
+        std::string verr;
+        zoneFileStatus_ =
+            "Imported: " + std::string(zoneFilePath_.data()) +
+            (ValidateZones(verr) ? "" : "  (warning: " + verr + ")");
+      } else {
+        zoneFileStatus_ = "Import failed: " + err;
+      }
+    }
+  }
+  // 경로를 이미 아는 경우 대화상자 없이 바로 덮어쓰기/다시읽기
+  if (zoneFilePath_[0] != '\0') {
+    if (ImGui::Button("Export", ImVec2(110, 0))) {
+      std::string err;
+      zoneFileStatus_ = SaveZones(zoneFilePath_.data(), err)
+                            ? "Exported: " + std::string(zoneFilePath_.data())
+                            : "Export failed: " + err;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload", ImVec2(110, 0))) {
+      std::string err;
+      zoneFileStatus_ = LoadZones(zoneFilePath_.data(), err)
+                            ? "Reloaded: " + std::string(zoneFilePath_.data())
+                            : "Reload failed: " + err;
+    }
+    ImGui::TextWrapped("%s", zoneFilePath_.data());
+  }
+  if (!zoneFileStatus_.empty()) {
+    ImGui::TextWrapped("%s", zoneFileStatus_.c_str());
+  }
+
+  ImGui::End();
 }
 
 void App::RenderConstellation(const StreamSnapshot &snapshot) {

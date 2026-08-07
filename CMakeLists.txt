@@ -23,10 +23,12 @@ if(BTS_FETCH_DEPS)
         GIT_SHALLOW TRUE
     )
 
+    # docking 브랜치: multi-viewport(ImGui 창을 OS 창으로 분리) + docking 지원.
+    # 릴리스 브랜치(v1.90.9)에는 이 기능이 없다.
     FetchContent_Declare(
         imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG v1.90.9
+        GIT_TAG v1.90.9-docking
         GIT_SHALLOW TRUE
     )
 
