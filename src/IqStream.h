@@ -63,6 +63,7 @@ inline size_t MinChunkBytesForFft(const StreamConfig &config) {
 struct StreamSnapshot {
   bool streamRunning = false;
   bool captureActive = false;
+  uint64_t captureBytes = 0; // 메모리에 누적된 캡처 payload 바이트 수
   bool connected = false;
   bool listening = false;
   uint64_t bytesSent = 0;   // 서버: 전송 / 수신: 수신 바이트 (모드별 의미)
@@ -107,13 +108,13 @@ public:
     freqOffsetHz_.store(hz, std::memory_order_relaxed);
   }
 
-  // 수신 payload를 지정 파일에 기록 시작. 성공 시 true.
+  // 수신 payload를 메모리에 누적 시작. 성공 시 true.
   bool StartCapture(const std::string &path, std::string &error);
-  // 캡처 중지 및 파일 flush/close.
+  // 캡처 중지. 누적된 payload 전체를 .bin 파일 하나로 기록한다.
   void StopCapture();
 
 protected:
-  // 캡처가 활성화된 경우 payload 바이트를 파일에 기록 (스레드 안전).
+  // 캡처가 활성화된 경우 payload 바이트를 메모리 버퍼에 이어붙임 (스레드 안전).
   void WriteCapture(const uint8_t *data, size_t n);
 
   // 워커 스레드 시작 전 스냅샷/버퍼 초기화 후 Run()을 새 스레드에서 실행.
@@ -151,10 +152,13 @@ protected:
   uint32_t wbPrevCenterKHz_ = 0;   // 직전 프레임 center (연속 dedup 판정용)
   bool wbHasPrevCenter_ = false;   // wbPrevCenterKHz_ 유효 여부
 
-  // 캡처: STX/ETX 프레임(payload) 1개를 파일 1개로 분리 저장.
-  // 캡처 시작 시 디렉터리를 만들고, WriteCapture 호출마다 인덱스 파일을 생성한다.
-  mutable std::mutex captureMutex_; // 캡처 상태 보호 (워커/UI 스레드 공유)
-  bool capturing_ = false;          // 캡처 활성 여부
-  std::string captureDir_;          // payload 파일을 저장할 디렉터리
-  uint64_t captureIndex_ = 0;       // payload 파일 인덱스 (1부터 증가)
+  // 캡처: STX/ETX를 벗겨낸 순수 payload(IQ)를 메모리에 계속 이어붙이다가,
+  // Stop Capture 시점에 .bin 파일 하나로 통째로 기록한다.
+  static constexpr size_t kCaptureReserveBytes = 64ULL * 1024 * 1024; // 64 MiB
+  static constexpr size_t kCaptureMaxBytes = 4ULL * 1024 * 1024 * 1024; // 4 GiB
+  mutable std::mutex captureMutex_;   // 캡처 상태 보호 (워커/UI 스레드 공유)
+  bool capturing_ = false;            // 캡처 활성 여부
+  bool captureOverflow_ = false;      // 메모리 상한 초과로 누적을 멈췄는지
+  std::string capturePath_;           // Stop 시 기록할 .bin 파일 경로
+  std::vector<uint8_t> captureBuffer_; // 누적된 payload 바이트
 };

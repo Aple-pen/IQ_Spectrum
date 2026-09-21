@@ -49,6 +49,9 @@ private:
   bool ValidateZones(std::string &error) const;
   // 검증 후 MSG-001(Zone Configuration) 바이트를 big-endian 으로 직렬화한다.
   bool BuildZoneConfigMsg(std::vector<uint8_t> &out, std::string &error) const;
+  // 컨트롤/스펙트럼 패널 사이의 세로 스플리터. 드래그로 controlsWidth_ 를
+  // 바꾸고, 더블클릭하면 기본값으로 되돌린다.
+  void RenderPanelSplitter();
   void RenderControls(const StreamSnapshot &snapshot);
   void RenderSpectrum(const StreamSnapshot &snapshot, float width);
   // 스펙트럼 라인 1개를 그린다. [i0, i0+count) 구간만 그리며(광대역 3단 분할에
@@ -98,6 +101,9 @@ private:
   bool yAxisAuto_ = true;
   float yAxisMin_ = -160.0f;
   float yAxisMax_ = 10.0f;
+  // 좌측 컨트롤 패널 폭(px). 패널 사이 스플리터를 드래그해 조절하며
+  // settings.ini 에 저장된다. 매 프레임 창 크기에 맞춰 clamp 한다.
+  float controlsWidth_ = 360.0f; // = kControlsWidthDefault (App.cpp)
   bool spectrumTiers_ = false; // 광대역 스펙트럼을 여러 단으로 나눠 표시
   int spectrumTierCount_ = 3;  // 분할할 단(段) 수
   bool showSpectrogram_ = false;

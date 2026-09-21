@@ -41,6 +41,13 @@ constexpr int kMaxSpectrogramCols = 1024;
 // 하나씩 그리므로 렌더 비용은 셀 수(행×열)에 비례한다.
 constexpr int kMaxSpectrogramRows = 240;
 
+// 좌측 컨트롤 패널의 폭 제약. 패널 사이 스플리터를 끌어 조절하며, 창이 좁아지면
+// 우측 스펙트럼이 최소 폭을 확보하도록 매 프레임 clamp 한다.
+constexpr float kControlsWidthDefault = 360.0f;
+constexpr float kControlsWidthMin = 260.0f; // 좌측 위젯이 안 깨지는 하한
+constexpr float kSpectrumWidthMin = 320.0f; // 우측 플롯 최소 확보 폭
+constexpr float kSplitterThickness = 6.0f;
+
 int PushImGuiTheme(bool dark) {
   if (dark) {
     // Dark: Charcoal Blue + Amber accent
@@ -287,6 +294,8 @@ void App::LoadSettings(const char *path) {
       yAxisMin_ = std::stof(val);
     } else if (key == "yAxisMax") {
       yAxisMax_ = std::stof(val);
+    } else if (key == "controlsWidth") {
+      controlsWidth_ = std::stof(val);
     } else if (key == "spectrumTiers") {
       spectrumTiers_ = val == "1";
     } else if (key == "spectrumTierCount") {
@@ -348,6 +357,7 @@ void App::SaveSettings(const char *path) const {
   f << "yAxisAuto=" << (yAxisAuto_ ? 1 : 0) << '\n';
   f << "yAxisMin=" << yAxisMin_ << '\n';
   f << "yAxisMax=" << yAxisMax_ << '\n';
+  f << "controlsWidth=" << controlsWidth_ << '\n';
   f << "spectrumTiers=" << (spectrumTiers_ ? 1 : 0) << '\n';
   f << "spectrumTierCount=" << spectrumTierCount_ << '\n';
   f << "showHistogram=" << (showSpectrogram_ ? 1 : 0) << '\n';
@@ -359,6 +369,7 @@ void App::SaveSettings(const char *path) const {
   f << "frequencyIndex=" << frequencyIndex_ << '\n';
 }
 
+//모드 설정.
 IqStream &App::Active() {
   if (mode_ == static_cast<int>(Mode::Wideband)) {
     return static_cast<IqStream &>(wbReceiver_);
@@ -401,6 +412,8 @@ void App::Render() {
                    ImGuiWindowFlags_NoBringToFrontOnFocus);
 
   RenderControls(snapshot);
+  ImGui::SameLine();
+  RenderPanelSplitter();
   ImGui::SameLine();
   RenderSpectrum(snapshot, 0.0f);
 
@@ -718,8 +731,46 @@ void App::BrowseFile() {
   }
 }
 
+void App::RenderPanelSplitter() {
+  // 부모 창의 사용 가능 폭 기준으로 유효 범위를 매 프레임 재계산한다. 메인 창은
+  // 뷰포트에 고정(NoResize)이라, OS 창을 줄이면 여기서 자동으로 따라 줄어든다.
+  // SameLine 을 두 번 쓰므로 ItemSpacing 도 두 번 들어간다.
+  const float total = ImGui::GetWindowContentRegionMax().x -
+                      ImGui::GetWindowContentRegionMin().x;
+  const float spacing = ImGui::GetStyle().ItemSpacing.x * 2.0f;
+  const float maxW =
+      std::max(kControlsWidthMin,
+               total - kSplitterThickness - spacing - kSpectrumWidthMin);
+  controlsWidth_ = std::clamp(controlsWidth_, kControlsWidthMin, maxW);
+
+  // InvisibleButton 은 0 크기를 assert 로 막는다. 창이 극단적으로 납작해지면
+  // avail.y 가 0 이하가 될 수 있으므로 하한을 둔다.
+  const float h = std::max(1.0f, ImGui::GetContentRegionAvail().y);
+  ImGui::InvisibleButton("##panelSplitter", ImVec2(kSplitterThickness, h));
+
+  const bool active = ImGui::IsItemActive();
+  const bool hovered = ImGui::IsItemHovered();
+  if (active) {
+    controlsWidth_ = std::clamp(controlsWidth_ + ImGui::GetIO().MouseDelta.x,
+                                kControlsWidthMin, maxW);
+  }
+  // 더블클릭 = 기본 폭 복귀
+  if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+    controlsWidth_ = std::clamp(kControlsWidthDefault, kControlsWidthMin, maxW);
+  }
+  if (active || hovered) {
+    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+  }
+  // 잡을 수 있다는 시각 힌트(hover/active 시에만 강조)
+  ImGui::GetWindowDrawList()->AddRectFilled(
+      ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+      ImGui::GetColorU32(active    ? ImGuiCol_SeparatorActive
+                         : hovered ? ImGuiCol_SeparatorHovered
+                                   : ImGuiCol_Separator));
+}
+
 void App::RenderControls(const StreamSnapshot &snapshot) {
-  ImGui::BeginChild("Controls", ImVec2(360, 0), true);
+  ImGui::BeginChild("Controls", ImVec2(controlsWidth_, 0), true);
   const ImVec4 accent = chartDark_ ? ImVec4(1.000f, 0.792f, 0.188f, 1.0f)
                                    : ImVec4(0.169f, 0.424f, 0.690f, 1.0f);
   const ImVec4 warnColor = chartDark_ ? ImVec4(1.000f, 0.576f, 0.196f, 1.0f)
@@ -1109,7 +1160,8 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
   ImGui::BeginDisabled(!receiveMode);
   if (!snapshot.captureActive) {
     if (ImGui::Button("Capture", ImVec2(110, 34))) {
-      // STX/ETX를 제외한 수신 payload를 파일로 기록 시작
+      // STX/ETX를 제외한 순수 payload를 메모리에 누적 시작
+      // (Stop Capture 시점에 .bin 파일 하나로 저장)
       const std::string path = MakeCaptureFileName(frequencyIndex_);
       std::string error;
       if (!Active().StartCapture(path, error)) {
@@ -1142,6 +1194,12 @@ void App::RenderControls(const StreamSnapshot &snapshot) {
               static_cast<unsigned long long>(snapshot.packetsSent));
   ImGui::Text("%s: %llu", recvLike ? "Recv bytes" : "Sent bytes",
               static_cast<unsigned long long>(snapshot.bytesSent));
+  if (snapshot.captureActive) {
+    // 캡처는 Stop 시점에 한 번에 기록하므로, 현재 메모리 사용량을 보여준다.
+    ImGui::Text("Capture buffer: %.1f MB (%llu bytes)",
+                static_cast<double>(snapshot.captureBytes) / (1024.0 * 1024.0),
+                static_cast<unsigned long long>(snapshot.captureBytes));
+  }
 
   if (!snapshot.error.empty()) {
     ImGui::TextColored(errColor, "%s", snapshot.error.c_str());

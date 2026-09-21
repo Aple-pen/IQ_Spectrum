@@ -375,51 +375,86 @@ void IqStream::SetStatus(const std::string &status, const std::string &error) {
 
 bool IqStream::StartCapture(const std::string &path, std::string &error) {
   std::lock_guard<std::mutex> lock(captureMutex_);
-  // path는 "<base>.bin" 형태. 확장자를 떼어 payload 파일들을 담을 디렉터리로
-  // 사용.
-  std::filesystem::path dir(path);
-  if (dir.has_extension()) {
-    dir.replace_extension();
+  // path는 "<base>.bin" 형태. 상위 디렉터리만 만들어 두고 파일 자체는
+  // StopCapture 시점에 한 번에 기록한다.
+  std::filesystem::path file(path);
+  if (!file.has_extension()) {
+    file.replace_extension(".bin");
   }
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  if (ec) {
-    error = "Failed to create capture directory: " + dir.string();
-    return false;
+  const std::filesystem::path dir = file.parent_path();
+  if (!dir.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+      error = "Failed to create capture directory: " + dir.string();
+      return false;
+    }
   }
-  captureDir_ = dir.string();
-  captureIndex_ = 0;
+  capturePath_ = file.string();
+  captureBuffer_.clear();
+  captureBuffer_.reserve(kCaptureReserveBytes);
+  captureOverflow_ = false;
   capturing_ = true;
   {
     std::lock_guard<std::mutex> snapLock(mutex_);
     snapshot_.captureActive = true;
+    snapshot_.captureBytes = 0;
   }
   return true;
 }
 
 void IqStream::StopCapture() {
-  std::lock_guard<std::mutex> lock(captureMutex_);
-  capturing_ = false;
-  captureDir_.clear();
+  std::string path;
+  std::vector<uint8_t> buffer;
+  {
+    std::lock_guard<std::mutex> lock(captureMutex_);
+    if (!capturing_) {
+      return;
+    }
+    capturing_ = false;
+    captureOverflow_ = false;
+    path.swap(capturePath_);
+    buffer.swap(captureBuffer_); // 소유권을 넘겨 락을 빨리 푼다
+  }
+
+  // 누적된 payload 전체를 .bin 파일 하나로 기록.
+  std::string error;
+  if (!buffer.empty()) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      error = "Failed to open capture file: " + path;
+    } else {
+      out.write(reinterpret_cast<const char *>(buffer.data()),
+                static_cast<std::streamsize>(buffer.size()));
+      out.close();
+      if (!out) {
+        error = "Failed to write capture file: " + path;
+      }
+    }
+  }
+
   std::lock_guard<std::mutex> snapLock(mutex_);
   snapshot_.captureActive = false;
+  if (!error.empty()) {
+    snapshot_.error = error;
+  }
 }
 
 void IqStream::WriteCapture(const uint8_t *data, size_t n) {
   std::lock_guard<std::mutex> lock(captureMutex_);
-  if (!capturing_ || n == 0) {
+  if (!capturing_ || captureOverflow_ || n == 0) {
     return;
   }
-  // STX/ETX 프레임 1개의 payload를 인덱스 파일 1개로 저장.
-  ++captureIndex_;
-  char name[32];
-  std::snprintf(name, sizeof(name), "%06llu.bin",
-                static_cast<unsigned long long>(captureIndex_));
-  const std::filesystem::path file = std::filesystem::path(captureDir_) / name;
-  std::ofstream out(file, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    return; // 개별 파일 열기 실패는 캡처 전체를 멈추지 않음
+  // STX/ETX를 제외한 순수 payload를 메모리에 계속 이어붙인다.
+  if (captureBuffer_.size() + n > kCaptureMaxBytes) {
+    // 상한 초과: 더 쌓지 않고 지금까지 모은 분량만 보존한다 (Stop 시 기록).
+    captureOverflow_ = true;
+    std::lock_guard<std::mutex> snapLock(mutex_);
+    snapshot_.error = "Capture memory limit reached, stopped buffering";
+    return;
   }
-  out.write(reinterpret_cast<const char *>(data),
-            static_cast<std::streamsize>(n));
+  captureBuffer_.insert(captureBuffer_.end(), data, data + n);
+  const uint64_t total = static_cast<uint64_t>(captureBuffer_.size());
+  std::lock_guard<std::mutex> snapLock(mutex_);
+  snapshot_.captureBytes = total;
 }

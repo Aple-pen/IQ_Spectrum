@@ -10,3 +10,7 @@ CMakeUserPresets.json
 *.ilk
 *.exe
 *.bin
+.idea/
+*build*/
+
+
